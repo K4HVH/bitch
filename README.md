@@ -1,2 +1,2 @@
-# BETTY-BITCH
+# betty-bitch
 BETTY Intercept, Transform, &amp; Command Handler
