@@ -1,47 +1,52 @@
 # Dockerfile for BITCH - MAVLINK Interceptor
 # Multi-stage build with cargo-chef for dependency caching
-# Supports: amd64, arm64/v8
+# Cross-compilation for ARM64 without QEMU
+
+ARG TARGETARCH
 
 # Stage 1: Planner - Generate recipe for dependencies
-FROM --platform=$BUILDPLATFORM rust:1.83-slim AS planner
+FROM rust:1.83-slim AS planner
 WORKDIR /app
 RUN cargo install cargo-chef --version 0.1.67
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Stage 2: Cacher - Build dependencies only (cached layer)
-FROM --platform=$BUILDPLATFORM rust:1.83-slim AS cacher
+FROM rust:1.83-slim AS cacher
 WORKDIR /app
+ARG TARGETARCH
+
 RUN cargo install cargo-chef --version 0.1.67
 
-# Install cross-compilation tools for ARM if needed
-ARG TARGETPLATFORM
-RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+# Install cross-compilation tools for ARM64
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+    dpkg --add-architecture arm64 && \
     apt-get update && \
-    apt-get install -y gcc-aarch64-linux-gnu && \
+    apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross && \
     rustup target add aarch64-unknown-linux-gnu && \
     rm -rf /var/lib/apt/lists/*; \
     fi
 
 COPY --from=planner /app/recipe.json recipe.json
 
-# Build dependencies based on target platform
-RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+# Build dependencies based on target architecture
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
     cargo chef cook --release --target aarch64-unknown-linux-gnu --recipe-path recipe.json; \
     else \
     cargo chef cook --release --recipe-path recipe.json; \
     fi
 
 # Stage 3: Builder - Build the actual application
-FROM --platform=$BUILDPLATFORM rust:1.83-slim AS builder
+FROM rust:1.83-slim AS builder
 WORKDIR /app
+ARG TARGETARCH
 
-ARG TARGETPLATFORM
-
-# Install cross-compilation tools for ARM if needed
-RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+# Install cross-compilation tools for ARM64
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+    dpkg --add-architecture arm64 && \
     apt-get update && \
-    apt-get install -y gcc-aarch64-linux-gnu && \
+    apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross && \
     rustup target add aarch64-unknown-linux-gnu && \
     rm -rf /var/lib/apt/lists/*; \
     fi
@@ -53,9 +58,9 @@ COPY --from=cacher /usr/local/cargo /usr/local/cargo
 # Copy source code
 COPY . .
 
-# Build for the target platform
-RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
-    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc && \
+# Build for the target architecture
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
     cargo build --release --target aarch64-unknown-linux-gnu && \
     cp target/aarch64-unknown-linux-gnu/release/bitch /app/bitch; \
     else \
