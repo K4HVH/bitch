@@ -4,116 +4,33 @@ on:
   push:
     branches:
       - main
-    tags:
-      - 'v*'
-  pull_request:
-    branches:
-      - main
   workflow_dispatch:
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/${{ github.event.repository.name }}
-
 jobs:
-  build-and-push:
+  build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
 
-    strategy:
-      matrix:
-        arch: [amd64, arm64]
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
 
-      - name: Set lowercase image name
-        run: |
-          echo "IMAGE_NAME_LOWER=$(echo ${{ env.IMAGE_NAME }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+      - uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LOWER }}
-          tags: |
-            type=ref,event=branch,suffix=-${{ matrix.arch }}
-            type=ref,event=pr,suffix=-${{ matrix.arch }}
-            type=semver,pattern={{version}},suffix=-${{ matrix.arch }}
-            type=semver,pattern={{major}}.{{minor}},suffix=-${{ matrix.arch }}
-            type=semver,pattern={{major}},suffix=-${{ matrix.arch }}
-            type=sha,prefix={{branch}}-,suffix=-${{ matrix.arch }}
+      - id: lowercase
+        run: echo "repo=$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+      - uses: docker/build-push-action@v5
         with:
           context: .
-          platforms: linux/${{ matrix.arch }}
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
-          build-args: |
-            TARGETARCH=${{ matrix.arch }}
-
-  create-manifest:
-    runs-on: ubuntu-latest
-    needs: build-and-push
-    if: github.event_name != 'pull_request'
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set lowercase image name
-        run: |
-          echo "IMAGE_NAME_LOWER=$(echo ${{ env.IMAGE_NAME }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
-
-      - name: Create and push multi-arch manifests
-        env:
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LOWER }}
-        run: |
-          # Determine the base tag from the build (branch or tag name)
-          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            BASE_TAG="main"
-            # For main branch, also create 'latest' tag
-            docker buildx imagetools create -t ${IMAGE}:latest \
-              ${IMAGE}:${BASE_TAG}-amd64 \
-              ${IMAGE}:${BASE_TAG}-arm64
-          elif [[ "${{ github.ref }}" =~ ^refs/tags/v(.+)$ ]]; then
-            BASE_TAG="${BASH_REMATCH[1]}"
-          elif [[ "${{ github.ref }}" =~ ^refs/heads/(.+)$ ]]; then
-            BASE_TAG="${BASH_REMATCH[1]}"
-          else
-            echo "Unknown ref: ${{ github.ref }}"
-            exit 1
-          fi
-
-          # Create the main manifest for the base tag
-          docker buildx imagetools create -t ${IMAGE}:${BASE_TAG} \
-            ${IMAGE}:${BASE_TAG}-amd64 \
-            ${IMAGE}:${BASE_TAG}-arm64
-
-          echo "Created manifest: ${IMAGE}:${BASE_TAG}"
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/${{ steps.lowercase.outputs.repo }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
