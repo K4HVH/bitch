@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::plugins::PluginManager;
 use crate::rules::{parse_mavlink_message, ProcessResult, RuleEngine};
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
@@ -29,14 +30,14 @@ pub struct ProxyServer {
 }
 
 impl ProxyServer {
-    pub fn new(config: Config) -> Self {
-        let rule_engine = RuleEngine::new(config.rules.clone());
+    pub fn new(config: Config, plugin_manager: PluginManager) -> Result<Self> {
+        let rule_engine = RuleEngine::new(config.rules.clone(), plugin_manager)?;
 
-        Self {
+        Ok(Self {
             config: Arc::new(config),
             rule_engine: Arc::new(rule_engine),
             state: Arc::new(ProxyState::new()),
-        }
+        })
     }
 
     /// Start the proxy server

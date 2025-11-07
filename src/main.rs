@@ -1,11 +1,15 @@
 mod config;
+mod plugins;
 mod proxy;
 mod rules;
 
 use anyhow::Result;
+use std::path::PathBuf;
+use tracing::{info, warn};
 use tracing_subscriber::filter::LevelFilter;
 
 use crate::config::Config;
+use crate::plugins::PluginManager;
 use crate::proxy::ProxyServer;
 
 #[tokio::main]
@@ -17,8 +21,20 @@ async fn main() -> Result<()> {
     // Initialize logging
     init_logging(&config.logging.level);
 
+    // Initialize plugin manager
+    let mut plugin_manager = PluginManager::new()?;
+
+    // Load plugins
+    for (name, filename) in &config.plugins.load {
+        let path = PathBuf::from(&config.plugins.directory).join(filename);
+        match plugin_manager.load_plugin(name, &path) {
+            Ok(_) => info!("Loaded plugin: {}", name),
+            Err(e) => warn!("Failed to load plugin '{}': {}", name, e),
+        }
+    }
+
     // Create and run the proxy server
-    let server = ProxyServer::new(config);
+    let server = ProxyServer::new(config, plugin_manager)?;
     server.run().await
 }
 

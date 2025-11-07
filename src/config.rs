@@ -8,7 +8,23 @@ pub struct Config {
     pub network: NetworkConfig,
     pub logging: LoggingConfig,
     #[serde(default)]
+    pub plugins: PluginsConfig,
+    #[serde(default)]
     pub rules: Vec<CommandRule>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct PluginsConfig {
+    /// Directory containing plugin files
+    #[serde(default = "default_plugins_dir")]
+    pub directory: String,
+    /// List of plugins to load (name -> filename)
+    #[serde(default)]
+    pub load: HashMap<String, String>,
+}
+
+fn default_plugins_dir() -> String {
+    "plugins".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -42,6 +58,10 @@ pub struct CommandRule {
 
     /// Optional: Delay duration in seconds (for action = "delay")
     pub delay_seconds: Option<u64>,
+
+    /// Optional: List of plugins to execute when this rule matches
+    #[serde(default)]
+    pub plugins: Vec<String>,
 
     /// Optional: Human-readable description
     pub description: Option<String>,

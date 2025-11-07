@@ -1,9 +1,11 @@
 use crate::config::{CommandRule, RuleConditions};
+use crate::plugins::{PluginContext, PluginManager};
 use anyhow::Result;
 use mavlink::ardupilotmega::MavMessage;
 use mavlink::MavHeader;
+use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Result of processing a message through the rule engine
 #[derive(Debug)]
@@ -21,11 +23,15 @@ pub enum ProcessResult {
 /// Rule engine for processing MAVLINK messages
 pub struct RuleEngine {
     rules: Vec<CommandRule>,
+    plugin_manager: Arc<PluginManager>,
 }
 
 impl RuleEngine {
-    pub fn new(rules: Vec<CommandRule>) -> Self {
-        Self { rules }
+    pub fn new(rules: Vec<CommandRule>, plugin_manager: PluginManager) -> Result<Self> {
+        Ok(Self {
+            rules,
+            plugin_manager: Arc::new(plugin_manager),
+        })
     }
 
     /// Process a MAVLINK message and return the appropriate action
@@ -49,12 +55,57 @@ impl RuleEngine {
                     rule.description.as_deref().unwrap_or("no description")
                 );
 
+                // Execute plugins for this rule
+                self.execute_plugins(rule, header, msg);
+
                 return self.execute_action(rule);
             }
         }
 
         // No rule matched, forward by default
         ProcessResult::Forward
+    }
+
+    /// Execute all plugins attached to a rule
+    fn execute_plugins(&self, rule: &CommandRule, header: &MavHeader, msg: &MavMessage) {
+        if rule.plugins.is_empty() {
+            return;
+        }
+
+        // Build context for plugins
+        let context = self.build_plugin_context(header, msg);
+
+        // Execute each plugin
+        for plugin_name in &rule.plugins {
+            if let Err(e) = self.plugin_manager.execute_plugin(plugin_name, &context) {
+                warn!("Plugin '{}' execution failed: {}", plugin_name, e);
+            }
+        }
+    }
+
+    /// Build plugin context from MAVLINK message
+    fn build_plugin_context(&self, header: &MavHeader, msg: &MavMessage) -> PluginContext {
+        let message_type = get_message_name(msg);
+
+        let (target_system, target_component, command, params) = match msg {
+            MavMessage::COMMAND_LONG(cmd) => {
+                let command_name = get_command_name(&cmd.command);
+                let params = vec![
+                    cmd.param1, cmd.param2, cmd.param3, cmd.param4,
+                    cmd.param5, cmd.param6, cmd.param7,
+                ];
+                (cmd.target_system, cmd.target_component, Some(command_name), Some(params))
+            }
+            _ => (header.system_id, header.component_id, None, None),
+        };
+
+        PluginContext {
+            target_system,
+            target_component,
+            message_type,
+            command,
+            params,
+        }
     }
 
     /// Check if a message matches a specific rule

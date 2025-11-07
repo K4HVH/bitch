@@ -13,6 +13,14 @@ router_port = 14551
 [logging]
 level = "info"  # trace, debug, info, warn, error
 
+[plugins]
+directory = "plugins"
+
+# Plugins to load at startup (name = filename)
+[plugins.load]
+arm_notifier = "arm_notifier.lua"
+# webhook_example = "webhook_example.lua"
+
 # ============================================================================
 # COMMAND RULES
 # ============================================================================
@@ -33,14 +41,15 @@ level = "info"  # trace, debug, info, warn, error
 # Note: Messages that don't match any rule are forwarded immediately by default
 # ============================================================================
 
-# Delay ARM commands by 10 seconds
+# Delay ARM commands by 10 seconds and execute plugins
 # (DISARM commands with param1=0.0 won't match this rule and pass through immediately)
 [[rules]]
 message_type = "COMMAND_LONG"
 command = "MAV_CMD_COMPONENT_ARM_DISARM"
 action = "delay"
 delay_seconds = 10
-description = "Delay ARM commands by 10 seconds"
+plugins = ["arm_notifier"]  # Execute these plugins when rule matches
+description = "Delay ARM commands by 10 seconds and notify Arduino"
 
 [rules.conditions]
 param1 = 1.0
@@ -88,3 +97,28 @@ param1 = 1.0
 #
 # [rules.conditions]
 # param1 = 0.0  # Hold time
+
+# ============================================================================
+# PLUGIN SYSTEM
+# ============================================================================
+# Plugins are Lua scripts that execute when rules match. They have access to:
+#
+# - context.target_system    - Target system ID
+# - context.target_component - Target component ID
+# - context.message_type     - MAVLINK message type (e.g., "COMMAND_LONG")
+# - context.command          - Command name (e.g., "MAV_CMD_COMPONENT_ARM_DISARM")
+# - context.params           - Array of parameters [param1..param7]
+#
+# Available APIs:
+#   log.info(msg), log.warn(msg), log.error(msg), log.debug(msg)
+#   serial.write(port, baudrate, data, [timeout_ms])
+#   serial.write_line(port, baudrate, data, [timeout_ms])
+#   http.get(url, [headers])
+#   http.post(url, body, [headers])
+#   util.sleep(milliseconds)
+#   util.file_write(path, content)
+#   util.file_read(path)
+#
+# Example plugin usage:
+# plugins = ["arm_notifier", "webhook_example"]
+# ============================================================================
