@@ -1,6 +1,13 @@
 [package]
-name = "betty-bitch"
+name = "bitch"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+tokio = { version = "1.42", features = ["full"] }
+mavlink = { version = "0.13", features = ["ardupilotmega"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"

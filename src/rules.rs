@@ -1,0 +1,227 @@
+use crate::config::{CommandRule, RuleConditions};
+use anyhow::Result;
+use mavlink::ardupilotmega::MavMessage;
+use mavlink::MavHeader;
+use std::time::Duration;
+use tracing::{debug, info};
+
+/// Result of processing a message through the rule engine
+#[derive(Debug)]
+pub enum ProcessResult {
+    /// Forward the message immediately
+    Forward,
+    /// Delay the message by the specified duration
+    Delay(Duration),
+    /// Block the message completely
+    Block,
+    // Future: Modify could include modified packet data
+    // Modify(Vec<u8>),
+}
+
+/// Rule engine for processing MAVLINK messages
+pub struct RuleEngine {
+    rules: Vec<CommandRule>,
+}
+
+impl RuleEngine {
+    pub fn new(rules: Vec<CommandRule>) -> Self {
+        Self { rules }
+    }
+
+    /// Process a MAVLINK message and return the appropriate action
+    pub fn process_message(&self, header: &MavHeader, msg: &MavMessage) -> ProcessResult {
+        let msg_name = get_message_name(msg);
+        debug!(
+            "Processing message: sysid={}, compid={}, msg={}",
+            header.system_id, header.component_id, msg_name
+        );
+
+        // Find the first matching rule (rules are sorted by priority)
+        for rule in &self.rules {
+            if self.matches_rule(header, msg, rule) {
+                info!(
+                    "Rule matched: {} {} - {}",
+                    rule.message_type,
+                    rule.command
+                        .as_ref()
+                        .map(|cmd| format!("({})", cmd))
+                        .unwrap_or_default(),
+                    rule.description.as_deref().unwrap_or("no description")
+                );
+
+                return self.execute_action(rule);
+            }
+        }
+
+        // No rule matched, forward by default
+        ProcessResult::Forward
+    }
+
+    /// Check if a message matches a specific rule
+    fn matches_rule(&self, header: &MavHeader, msg: &MavMessage, rule: &CommandRule) -> bool {
+        // Check message type
+        let msg_name = get_message_name(msg);
+        if rule.message_type != msg_name {
+            return false;
+        }
+
+        // For COMMAND_LONG messages, check command name and parameters
+        if rule.message_type == "COMMAND_LONG" {
+            if let MavMessage::COMMAND_LONG(cmd) = msg {
+                // Check command name if specified
+                if let Some(ref expected_cmd) = rule.command {
+                    let actual_cmd = get_command_name(&cmd.command);
+                    if actual_cmd != *expected_cmd {
+                        debug!("Command mismatch: expected {}, got {}", expected_cmd, actual_cmd);
+                        return false;
+                    }
+                }
+
+                // Check conditions
+                if !self.matches_conditions(header, cmd, &rule.conditions) {
+                    return false;
+                }
+
+                return true;
+            }
+        }
+
+        // Add support for other message types here
+        // For now, if we reach here, the message type matched but no specific handler exists
+        false
+    }
+
+    /// Check if conditions match for a COMMAND_LONG message
+    fn matches_conditions(
+        &self,
+        header: &MavHeader,
+        cmd: &mavlink::ardupilotmega::COMMAND_LONG_DATA,
+        conditions: &RuleConditions,
+    ) -> bool {
+        // Check system_id
+        if let Some(expected_sysid) = conditions.system_id {
+            if header.system_id != expected_sysid {
+                debug!("System ID mismatch: expected {}, got {}", expected_sysid, header.system_id);
+                return false;
+            }
+        }
+
+        // Check component_id
+        if let Some(expected_compid) = conditions.component_id {
+            if header.component_id != expected_compid {
+                debug!("Component ID mismatch: expected {}, got {}", expected_compid, header.component_id);
+                return false;
+            }
+        }
+
+        // Check parameters
+        if let Some(expected) = conditions.param1 {
+            if (cmd.param1 - expected).abs() > f32::EPSILON {
+                debug!("param1 mismatch: expected {}, got {}", expected, cmd.param1);
+                return false;
+            }
+        }
+
+        if let Some(expected) = conditions.param2 {
+            if (cmd.param2 - expected).abs() > f32::EPSILON {
+                debug!("param2 mismatch: expected {}, got {}", expected, cmd.param2);
+                return false;
+            }
+        }
+
+        if let Some(expected) = conditions.param3 {
+            if (cmd.param3 - expected).abs() > f32::EPSILON {
+                debug!("param3 mismatch: expected {}, got {}", expected, cmd.param3);
+                return false;
+            }
+        }
+
+        if let Some(expected) = conditions.param4 {
+            if (cmd.param4 - expected).abs() > f32::EPSILON {
+                debug!("param4 mismatch: expected {}, got {}", expected, cmd.param4);
+                return false;
+            }
+        }
+
+        if let Some(expected) = conditions.param5 {
+            if (cmd.param5 - expected).abs() > f32::EPSILON {
+                debug!("param5 mismatch: expected {}, got {}", expected, cmd.param5);
+                return false;
+            }
+        }
+
+        if let Some(expected) = conditions.param6 {
+            if (cmd.param6 - expected).abs() > f32::EPSILON {
+                debug!("param6 mismatch: expected {}, got {}", expected, cmd.param6);
+                return false;
+            }
+        }
+
+        if let Some(expected) = conditions.param7 {
+            if (cmd.param7 - expected).abs() > f32::EPSILON {
+                debug!("param7 mismatch: expected {}, got {}", expected, cmd.param7);
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Execute the action specified by a rule
+    fn execute_action(&self, rule: &CommandRule) -> ProcessResult {
+        match rule.action.as_str() {
+            "delay" => {
+                let delay = Duration::from_secs(rule.delay_seconds.unwrap_or(0));
+                ProcessResult::Delay(delay)
+            }
+            "block" => ProcessResult::Block,
+            "forward" => ProcessResult::Forward,
+            "modify" => {
+                // Future: implement message modification
+                info!("Modify action not yet implemented, forwarding");
+                ProcessResult::Forward
+            }
+            _ => {
+                info!("Unknown action '{}', forwarding", rule.action);
+                ProcessResult::Forward
+            }
+        }
+    }
+}
+
+/// Parse a MAVLINK message from raw packet data
+pub fn parse_mavlink_message(packet: &[u8]) -> Result<(MavHeader, MavMessage)> {
+    use mavlink::peek_reader::PeekReader;
+    use std::io::Cursor;
+
+    let cursor = Cursor::new(packet);
+    let mut peek_reader = PeekReader::new(cursor);
+
+    // Try to read as MAVLink v2 message
+    match mavlink::read_v2_msg::<MavMessage, _>(&mut peek_reader) {
+        Ok((header, msg)) => Ok((header, msg)),
+        Err(_) => {
+            // Try v1 if v2 fails
+            let cursor = Cursor::new(packet);
+            let mut peek_reader = PeekReader::new(cursor);
+            mavlink::read_v1_msg::<MavMessage, _>(&mut peek_reader)
+                .map_err(|e| anyhow::anyhow!("Failed to parse MAVLink: {:?}", e))
+        }
+    }
+}
+
+/// Get the name of a MAVLINK message enum variant as a string
+pub fn get_message_name(msg: &MavMessage) -> String {
+    let debug_str = format!("{:?}", msg);
+    // Extract just the variant name (before the '(')
+    debug_str
+        .split('(')
+        .next()
+        .unwrap_or("UNKNOWN")
+        .to_string()
+}
+
+/// Get the name of a MAVLink command enum variant as a string
+fn get_command_name(cmd: &mavlink::ardupilotmega::MavCmd) -> String {
+    format!("{:?}", cmd)
+}

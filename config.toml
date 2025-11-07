@@ -1,0 +1,90 @@
+# BITCH Configuration
+# MAVLINK command interceptor and modifier
+
+[network]
+# Port to listen on for GCS (Mission Planner) connections
+gcs_listen_port = 14550
+gcs_listen_address = "0.0.0.0"
+
+# Mavlink-router connection
+router_address = "127.0.0.1"
+router_port = 14551
+
+[logging]
+level = "info"  # trace, debug, info, warn, error
+
+# ============================================================================
+# COMMAND RULES
+# ============================================================================
+# Rules are processed in priority order (highest priority first).
+# The first matching rule determines the action for a message.
+#
+# Available actions: "delay", "block", "forward", "modify"
+# Available message_type: "COMMAND_LONG", "HEARTBEAT", "MISSION_ITEM", etc.
+#
+# For COMMAND_LONG, specify the command name:
+#   - command: "MAV_CMD_COMPONENT_ARM_DISARM", "MAV_CMD_NAV_TAKEOFF", etc.
+#
+# Conditions can match on:
+#   - param1-7: Parameter values
+#   - system_id: Specific system ID
+#   - component_id: Specific component ID
+#
+# Note: Messages that don't match any rule are forwarded immediately by default
+# ============================================================================
+
+# Delay ARM commands by 10 seconds
+# (DISARM commands with param1=0.0 won't match this rule and pass through immediately)
+[[rules]]
+message_type = "COMMAND_LONG"
+command = "MAV_CMD_COMPONENT_ARM_DISARM"
+action = "delay"
+delay_seconds = 10
+description = "Delay ARM commands by 10 seconds"
+
+[rules.conditions]
+param1 = 1.0
+
+# ============================================================================
+# EXAMPLE RULES (commented out)
+# ============================================================================
+
+# Block all mode change commands
+# [[rules]]
+# message_type = "COMMAND_LONG"
+# command = "MAV_CMD_DO_SET_MODE"
+# action = "block"
+# description = "Block mode change commands"
+# priority = 10
+
+# Delay mission start by 5 seconds
+# [[rules]]
+# message_type = "COMMAND_LONG"
+# command = "MAV_CMD_MISSION_START"
+# action = "delay"
+# delay_seconds = 5
+# description = "Delay mission start"
+# priority = 10
+
+# Block takeoff commands from a specific system
+# [[rules]]
+# message_type = "COMMAND_LONG"
+# command = "MAV_CMD_NAV_TAKEOFF"
+# action = "block"
+# description = "Block takeoff from system 1"
+# priority = 10
+#
+# [rules.conditions]
+# system_id = 1
+
+# Delay waypoint commands with specific parameters
+# [[rules]]
+# message_type = "COMMAND_LONG"
+# command = "MAV_CMD_NAV_WAYPOINT"
+# action = "delay"
+# delay_seconds = 3
+# description = "Delay waypoint commands"
+# priority = 5
+#
+# [rules.conditions]
+# param1 = 0.0  # Hold time
