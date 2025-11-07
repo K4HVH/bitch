@@ -83,24 +83,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha,prefix={{branch}}-
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Create and push multi-arch manifest
+      - name: Create and push multi-arch manifests
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         run: |
-          TAGS="${{ steps.meta.outputs.tags }}"
-          for tag in $TAGS; do
-            docker buildx imagetools create -t $tag \
-              ${tag}-amd64 \
-              ${tag}-arm64
-          done
+          # Determine the base tag from the build (branch or tag name)
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            BASE_TAG="main"
+            # For main branch, also create 'latest' tag
+            docker buildx imagetools create -t ${IMAGE}:latest \
+              ${IMAGE}:${BASE_TAG}-amd64 \
+              ${IMAGE}:${BASE_TAG}-arm64
+          elif [[ "${{ github.ref }}" =~ ^refs/tags/v(.+)$ ]]; then
+            BASE_TAG="${BASH_REMATCH[1]}"
+          elif [[ "${{ github.ref }}" =~ ^refs/heads/(.+)$ ]]; then
+            BASE_TAG="${BASH_REMATCH[1]}"
+          else
+            echo "Unknown ref: ${{ github.ref }}"
+            exit 1
+          fi
+
+          # Create the main manifest for the base tag
+          docker buildx imagetools create -t ${IMAGE}:${BASE_TAG} \
+            ${IMAGE}:${BASE_TAG}-amd64 \
+            ${IMAGE}:${BASE_TAG}-arm64
+
+          echo "Created manifest: ${IMAGE}:${BASE_TAG}"
