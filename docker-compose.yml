@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  bitch:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bitch:latest
+    container_name: bitch
+    restart: unless-stopped
+
+    # Network mode: host allows direct access to mavlink-router on localhost
+    network_mode: host
+
+    # Alternative: Use bridge mode with port mapping
+    # ports:
+    #   - "14550:14550/udp"
+
+    volumes:
+      # Mount custom config if needed
+      - ./config.toml:/app/config.toml:ro
+
+    environment:
+      - RUST_LOG=info
+
+    # Run as non-root user
+    user: "1000:1000"
+
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+
+    # Resource limits (adjust as needed)
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 256M
+        reservations:
+          cpus: '0.5'
+          memory: 128M
