@@ -16,15 +16,35 @@ services:
     # ports:
     #   - "14550:14550/udp"
 
+    # Serial device access - REQUIRED for Arduino/serial communication
+    devices:
+      - /dev/ttyUSB0:/dev/ttyUSB0
+      # Add more devices as needed:
+      # - /dev/ttyUSB1:/dev/ttyUSB1
+      # - /dev/ttyACM0:/dev/ttyACM0
+
+    # Alternative: privileged mode (less secure, but gives access to all devices)
+    # privileged: true
+
     volumes:
       # Mount custom config if needed
       - ./config.toml:/app/config.toml:ro
+      # Mount plugins directory
+      - ./plugins:/app/plugins:ro
 
     environment:
       - RUST_LOG=info
 
     # Run as non-root user
+    # NOTE: User must have permissions for serial device
+    # Check your user's UID/GID with: id -u && id -g
+    # On most systems, you need to be in the 'dialout' group for serial access
     user: "1000:1000"
+
+    # Add dialout group for serial access (group ID is usually 20 on most systems)
+    # Check with: getent group dialout
+    group_add:
+      - "20"  # dialout group - adjust if your system uses a different GID
 
     # Security options
     security_opt:
