@@ -18,11 +18,11 @@ pub struct AckInfo {
 /// Result of processing a message through the rule engine
 #[derive(Debug)]
 pub struct ProcessResult {
-    pub action: Action,
+    pub actions: Vec<Action>,
     pub ack_info: Option<AckInfo>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Action {
     /// Forward the message immediately
     Forward,
@@ -85,7 +85,7 @@ impl RuleEngine {
 
         // No rule matched, forward by default
         ProcessResult {
-            action: Action::Forward,
+            actions: vec![Action::Forward],
             ack_info: None,
         }
     }
@@ -242,7 +242,7 @@ impl RuleEngine {
         true
     }
 
-    /// Execute the action specified by a rule
+    /// Execute the action sequence specified by a rule
     fn execute_action(&self, rule: &CommandRule, msg: &MavMessage) -> ProcessResult {
         // Build ACK info if auto_ack is enabled and this is a COMMAND_LONG
         let ack_info = if rule.auto_ack {
@@ -261,37 +261,44 @@ impl RuleEngine {
             None
         };
 
-        let action = match rule.action.as_str() {
-            "delay" => {
-                let delay = Duration::from_secs(rule.delay_seconds.unwrap_or(0));
-                Action::Delay(delay)
-            }
-            "batch" => {
-                let count = rule.batch_count.unwrap_or(1);
-                let timeout = Duration::from_secs(rule.batch_timeout_seconds.unwrap_or(30));
-                let key = rule.batch_key.clone();
-                let forward_on_timeout = rule.batch_timeout_forward;
-                Action::Batch {
-                    count,
-                    timeout,
-                    key,
-                    forward_on_timeout,
-                }
-            }
-            "block" => Action::Block,
-            "forward" => Action::Forward,
-            "modify" => {
-                // Future: implement message modification
-                info!("Modify action not yet implemented, forwarding");
-                Action::Forward
-            }
-            _ => {
-                info!("Unknown action '{}', forwarding", rule.action);
-                Action::Forward
-            }
-        };
+        // Build action sequence from rule
+        let action_names = rule.get_actions();
+        let mut actions = Vec::new();
 
-        ProcessResult { action, ack_info }
+        for action_name in action_names {
+            let action = match action_name.as_str() {
+                "delay" => {
+                    let delay = Duration::from_secs(rule.delay_seconds.unwrap_or(0));
+                    Action::Delay(delay)
+                }
+                "batch" => {
+                    let count = rule.batch_count.unwrap_or(1);
+                    let timeout = Duration::from_secs(rule.batch_timeout_seconds.unwrap_or(30));
+                    let key = rule.batch_key.clone();
+                    let forward_on_timeout = rule.batch_timeout_forward;
+                    Action::Batch {
+                        count,
+                        timeout,
+                        key,
+                        forward_on_timeout,
+                    }
+                }
+                "block" => Action::Block,
+                "forward" => Action::Forward,
+                "modify" => {
+                    // Future: implement message modification
+                    info!("Modify action not yet implemented, using forward");
+                    Action::Forward
+                }
+                _ => {
+                    info!("Unknown action '{}', using forward", action_name);
+                    Action::Forward
+                }
+            };
+            actions.push(action);
+        }
+
+        ProcessResult { actions, ack_info }
     }
 }
 

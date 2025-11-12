@@ -61,8 +61,15 @@ pub struct CommandRule {
     #[serde(default)]
     pub conditions: RuleConditions,
 
-    /// The action to take: "delay", "block", "forward", "modify"
-    pub action: String,
+    /// The action to take: "delay", "block", "forward", "modify", "batch"
+    /// DEPRECATED: Use `actions` array instead for sequential actions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+
+    /// Sequential actions to apply (e.g., ["batch", "delay"])
+    /// If not specified, will use single `action` field for backward compatibility
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actions: Option<Vec<String>>,
 
     /// Optional: Delay duration in seconds (for action = "delay")
     pub delay_seconds: Option<u64>,
@@ -97,6 +104,19 @@ pub struct CommandRule {
     /// Optional: Priority (higher = checked first). Default: 0
     #[serde(default)]
     pub priority: i32,
+}
+
+impl CommandRule {
+    /// Get the normalized actions array (handles backward compatibility)
+    pub fn get_actions(&self) -> Vec<String> {
+        if let Some(ref actions) = self.actions {
+            actions.clone()
+        } else if let Some(ref action) = self.action {
+            vec![action.clone()]
+        } else {
+            vec![]
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -144,31 +164,42 @@ impl Config {
 
         // Validate rules
         for (idx, rule) in self.rules.iter().enumerate() {
-            if !["delay", "block", "forward", "modify", "batch"].contains(&rule.action.as_str()) {
-                anyhow::bail!(
-                    "Rule {} has invalid action '{}'. Must be: delay, block, forward, modify, or batch",
-                    idx,
-                    rule.action
-                );
+            let actions = rule.get_actions();
+
+            // Ensure at least one action is specified
+            if actions.is_empty() {
+                anyhow::bail!("Rule {} has no action or actions specified", idx);
             }
 
-            if rule.action == "delay" && rule.delay_seconds.is_none() {
+            // Validate each action
+            for action in &actions {
+                if !["delay", "block", "forward", "modify", "batch"].contains(&action.as_str()) {
+                    anyhow::bail!(
+                        "Rule {} has invalid action '{}'. Must be: delay, block, forward, modify, or batch",
+                        idx,
+                        action
+                    );
+                }
+            }
+
+            // Validate action-specific requirements
+            if actions.contains(&"delay".to_string()) && rule.delay_seconds.is_none() {
                 anyhow::bail!(
-                    "Rule {} has action 'delay' but no delay_seconds specified",
+                    "Rule {} has 'delay' action but no delay_seconds specified",
                     idx
                 );
             }
 
-            if rule.action == "batch" {
+            if actions.contains(&"batch".to_string()) {
                 if rule.batch_count.is_none() {
                     anyhow::bail!(
-                        "Rule {} has action 'batch' but no batch_count specified",
+                        "Rule {} has 'batch' action but no batch_count specified",
                         idx
                     );
                 }
                 if rule.batch_timeout_seconds.is_none() {
                     anyhow::bail!(
-                        "Rule {} has action 'batch' but no batch_timeout_seconds specified",
+                        "Rule {} has 'batch' action but no batch_timeout_seconds specified",
                         idx
                     );
                 }

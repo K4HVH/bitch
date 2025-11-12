@@ -1,3 +1,4 @@
+use crate::rules::Action;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,8 +12,11 @@ use tracing::{debug, error, info, warn};
 pub enum BatchResult {
     /// Message queued, still waiting for more
     Queued,
-    /// Threshold met or timeout occurred, release all packets
-    Release(Vec<Vec<u8>>),
+    /// Threshold met or timeout occurred, release all packets with remaining actions
+    Release {
+        packets: Vec<Vec<u8>>,
+        remaining_actions: Vec<Action>,
+    },
 }
 
 /// A single queued packet
@@ -31,16 +35,19 @@ struct BatchState {
     created_at: Instant,
     /// Whether to forward on timeout
     forward_on_timeout: bool,
+    /// Remaining actions to apply after batch releases
+    remaining_actions: Vec<Action>,
 }
 
 impl BatchState {
-    fn new(threshold: usize, forward_on_timeout: bool) -> Self {
+    fn new(threshold: usize, forward_on_timeout: bool, remaining_actions: Vec<Action>) -> Self {
         Self {
             packets: Vec::new(),
             systems: HashSet::new(),
             threshold,
             created_at: Instant::now(),
             forward_on_timeout,
+            remaining_actions,
         }
     }
 
@@ -53,8 +60,8 @@ impl BatchState {
         self.systems.len() >= self.threshold
     }
 
-    fn release(self) -> Vec<Vec<u8>> {
-        self.packets
+    fn release(self) -> (Vec<Vec<u8>>, Vec<Action>) {
+        (self.packets, self.remaining_actions)
     }
 }
 
@@ -80,6 +87,7 @@ impl BatchManager {
         threshold: usize,
         timeout: Duration,
         forward_on_timeout: bool,
+        remaining_actions: Vec<Action>,
         router_socket: Arc<UdpSocket>,
     ) -> BatchResult {
         let mut batches = self.batches.write().await;
@@ -104,7 +112,7 @@ impl BatchManager {
                     Self::handle_timeout(batches_clone, key_clone, router_socket_clone).await;
                 });
 
-                BatchState::new(threshold, forward_on_timeout)
+                BatchState::new(threshold, forward_on_timeout, remaining_actions.clone())
             });
 
         // Add packet to batch
@@ -121,14 +129,17 @@ impl BatchManager {
         // Check if threshold is met
         if batch.is_ready() {
             let batch_state = batches.remove(&key).unwrap();
-            let packets = batch_state.release();
+            let (packets, remaining_actions) = batch_state.release();
             info!(
                 "Batch '{}' threshold met! Releasing {} packets from {} systems",
                 key,
                 packets.len(),
                 unique_count
             );
-            BatchResult::Release(packets)
+            BatchResult::Release {
+                packets,
+                remaining_actions,
+            }
         } else {
             BatchResult::Queued
         }
@@ -153,8 +164,8 @@ impl BatchManager {
                     key, elapsed, unique_count, batch.threshold, packet_count
                 );
 
-                // Forward all packets
-                let packets = batch.release();
+                // Forward all packets (timeout doesn't apply remaining actions - just forwards)
+                let (packets, _remaining_actions) = batch.release();
                 for packet in packets {
                     if let Err(e) = router_socket.send(&packet).await {
                         error!("Failed to send timed-out batch packet: {}", e);

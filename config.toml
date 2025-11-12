@@ -41,19 +41,20 @@ arm_notifier = "arm_notifier.lua"
 # Note: Messages that don't match any rule are forwarded immediately by default
 # ============================================================================
 
-# Batch ARM commands across multiple drones
+# Batch ARM commands across multiple drones, then delay before releasing
 # (DISARM commands with param1=0.0 won't match this rule and pass through immediately)
 [[rules]]
 message_type = "COMMAND_LONG"
 command = "MAV_CMD_COMPONENT_ARM_DISARM"
-action = "batch"
+actions = ["batch", "delay"]      # First batch, then delay all packets
 batch_count = 2                    # Wait for 2 unique drones to send ARM
 batch_timeout_seconds = 60         # Timeout after 60 seconds
 batch_timeout_forward = true       # Forward on timeout even if threshold not met
 batch_key = "arm_swarm"           # Batch group identifier
+delay_seconds = 5                  # Delay after batch completes
 auto_ack = true                   # Send immediate COMMAND_ACK to GCS so it doesn't wait
 plugins = ["arm_notifier"]        # Execute these plugins when rule matches
-description = "Synchronize ARM commands across 2 drones"
+description = "Synchronize ARM commands across 2 drones, then delay 5s before arming"
 
 [rules.conditions]
 param1 = 1.0

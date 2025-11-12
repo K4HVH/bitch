@@ -5,7 +5,9 @@ use crate::rules::{parse_mavlink_message, Action, AckInfo, ProcessResult, RuleEn
 use anyhow::{Context, Result};
 use mavlink::ardupilotmega::{MavMessage, COMMAND_ACK_DATA};
 use mavlink::{MavHeader, MavlinkVersion};
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
@@ -42,6 +44,128 @@ impl ProxyServer {
             config: Arc::new(config),
             rule_engine: Arc::new(rule_engine),
             state: Arc::new(ProxyState::new()),
+        })
+    }
+
+    /// Execute a sequence of actions on a packet
+    async fn execute_actions(
+        actions: Vec<Action>,
+        packet: Vec<u8>,
+        router_socket: Arc<UdpSocket>,
+        state: Arc<ProxyState>,
+    ) {
+        Self::execute_actions_impl(actions, vec![packet], router_socket, state).await;
+    }
+
+    /// Execute a sequence of actions on multiple packets
+    fn execute_actions_impl(
+        mut actions: Vec<Action>,
+        packets: Vec<Vec<u8>>,
+        router_socket: Arc<UdpSocket>,
+        state: Arc<ProxyState>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(async move {
+        if actions.is_empty() {
+            // No actions, forward all packets
+            for packet in packets {
+                if let Err(e) = router_socket.send(&packet).await {
+                    error!("Failed to forward packet: {}", e);
+                }
+            }
+            return;
+        }
+
+        // Take first action and process
+        let action = actions.remove(0);
+        let remaining_actions = actions;
+
+        match action {
+            Action::Forward => {
+                // Forward and continue with remaining actions
+                Self::execute_actions_impl(remaining_actions, packets, router_socket, state).await;
+            }
+            Action::Block => {
+                warn!("Message(s) blocked by rule");
+                // Don't process remaining actions
+            }
+            Action::Delay(duration) => {
+                // Spawn task to delay then continue with remaining actions
+                let delay_secs = duration.as_secs();
+                info!(
+                    "Message(s) queued for {}s delay (other traffic continues)",
+                    delay_secs
+                );
+
+                tokio::spawn(async move {
+                    sleep(duration).await;
+                    Self::execute_actions_impl(remaining_actions, packets, router_socket, state)
+                        .await;
+                    info!("Delayed message(s) forwarded after {}s", delay_secs);
+                });
+            }
+            Action::Batch {
+                count,
+                timeout,
+                key,
+                forward_on_timeout,
+            } => {
+                // Batch action only makes sense for single packets
+                if packets.len() != 1 {
+                    warn!("Batch action applied to {} packets, only batching first", packets.len());
+                }
+
+                let packet = packets.into_iter().next().unwrap();
+
+                // Extract system ID
+                let system_id = if let Ok((header, msg)) = parse_mavlink_message(&packet) {
+                    match msg {
+                        MavMessage::COMMAND_LONG(cmd) => cmd.target_system,
+                        _ => header.system_id,
+                    }
+                } else {
+                    0
+                };
+
+                let batch_result = state
+                    .batch_manager
+                    .queue_or_release(
+                        key.clone(),
+                        system_id,
+                        packet,
+                        count,
+                        timeout,
+                        forward_on_timeout,
+                        remaining_actions.clone(),
+                        router_socket.clone(),
+                    )
+                    .await;
+
+                match batch_result {
+                    BatchResult::Queued => {
+                        // Packet queued, nothing more to do
+                    }
+                    BatchResult::Release {
+                        packets,
+                        remaining_actions,
+                    } => {
+                        // Threshold met, apply remaining actions to all packets
+                        info!(
+                            "Batch '{}' threshold met, applying {} remaining action(s) to {} packets",
+                            key,
+                            remaining_actions.len(),
+                            packets.len()
+                        );
+                        Self::execute_actions_impl(
+                            remaining_actions,
+                            packets,
+                            router_socket,
+                            state,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
         })
     }
 
@@ -84,6 +208,7 @@ impl ProxyServer {
         info!("   Rules loaded: {}", self.config.rules.len());
 
         for rule in &self.config.rules {
+            let actions_str = rule.get_actions().join(" -> ");
             info!(
                 "   - {} {} -> {} {}",
                 rule.message_type,
@@ -91,7 +216,7 @@ impl ProxyServer {
                     .as_ref()
                     .map(|cmd| format!("({})", cmd))
                     .unwrap_or_default(),
-                rule.action,
+                actions_str,
                 rule.delay_seconds
                     .map(|d| format!("({}s)", d))
                     .unwrap_or_default()
@@ -195,7 +320,7 @@ impl ProxyServer {
                         // If we can't parse it, forward it anyway
                         debug!("Failed to parse message, forwarding anyway");
                         ProcessResult {
-                            action: Action::Forward,
+                            actions: vec![Action::Forward],
                             ack_info: None,
                         }
                     };
@@ -214,94 +339,14 @@ impl ProxyServer {
                         }
                     }
 
-                    match result.action {
-                        Action::Forward => {
-                            // Forward immediately
-                            if let Err(e) = router_socket.send(packet).await {
-                                error!("Failed to forward to router: {}", e);
-                            } else {
-                                debug!("Forwarded immediately");
-                            }
-                        }
-                        Action::Delay(duration) => {
-                            // Spawn a task to delay and forward
-                            let router_socket = router_socket.clone();
-                            let packet = packet.to_vec();
-                            let delay_secs = duration.as_secs();
-
-                            info!(
-                                "Message queued for {}s delay (other traffic continues)",
-                                delay_secs
-                            );
-
-                            tokio::spawn(async move {
-                                sleep(duration).await;
-                                if let Err(e) = router_socket.send(&packet).await {
-                                    error!("Failed to send delayed packet: {}", e);
-                                } else {
-                                    info!("Delayed message forwarded after {}s", delay_secs);
-                                }
-                            });
-
-                            // Loop continues immediately - other traffic flows normally
-                        }
-                        Action::Batch {
-                            count,
-                            timeout,
-                            key,
-                            forward_on_timeout,
-                        } => {
-                            // Queue packet in batch manager
-                            let packet = packet.to_vec();
-
-                            // Extract the target system ID from the message
-                            // For COMMAND_LONG, this is the drone being commanded, not the GCS
-                            let system_id = if let Ok((header, msg)) = parse_mavlink_message(&packet) {
-                                match msg {
-                                    MavMessage::COMMAND_LONG(cmd) => cmd.target_system,
-                                    _ => header.system_id,
-                                }
-                            } else {
-                                // If we can't parse, use 0 as fallback
-                                0
-                            };
-
-                            let batch_result = state
-                                .batch_manager
-                                .queue_or_release(
-                                    key.clone(),
-                                    system_id,
-                                    packet,
-                                    count,
-                                    timeout,
-                                    forward_on_timeout,
-                                    router_socket.clone(),
-                                )
-                                .await;
-
-                            match batch_result {
-                                BatchResult::Queued => {
-                                    // Packet queued, continue processing other messages
-                                }
-                                BatchResult::Release(packets) => {
-                                    // Threshold met, forward all packets
-                                    info!(
-                                        "Batch '{}' threshold met, forwarding {} packets",
-                                        key,
-                                        packets.len()
-                                    );
-                                    for packet in packets {
-                                        if let Err(e) = router_socket.send(&packet).await {
-                                            error!("Failed to forward batch packet: {}", e);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Action::Block => {
-                            warn!("Message blocked by rule");
-                        }
-                    }
+                    // Execute action sequence
+                    Self::execute_actions(
+                        result.actions,
+                        packet.to_vec(),
+                        router_socket.clone(),
+                        state.clone(),
+                    )
+                    .await;
                 }
                 Err(e) => {
                     error!("Error receiving from GCS: {}", e);
