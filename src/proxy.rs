@@ -1,7 +1,9 @@
 use crate::config::Config;
 use crate::plugins::PluginManager;
-use crate::rules::{parse_mavlink_message, ProcessResult, RuleEngine};
+use crate::rules::{parse_mavlink_message, Action, AckInfo, ProcessResult, RuleEngine};
 use anyhow::{Context, Result};
+use mavlink::ardupilotmega::{MavMessage, COMMAND_ACK_DATA};
+use mavlink::{MavHeader, MavlinkVersion};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -38,6 +40,31 @@ impl ProxyServer {
             rule_engine: Arc::new(rule_engine),
             state: Arc::new(ProxyState::new()),
         })
+    }
+
+    /// Build a COMMAND_ACK message
+    fn build_command_ack(ack_info: &AckInfo) -> Vec<u8> {
+        let ack_data = COMMAND_ACK_DATA {
+            command: ack_info.command,
+            result: mavlink::ardupilotmega::MavResult::MAV_RESULT_ACCEPTED,
+        };
+
+        // CRITICAL: The ACK must appear to come FROM the target system (drone),
+        // not from the proxy. This is what Mission Planner expects.
+        let header = MavHeader {
+            system_id: ack_info.target_system,     // Use drone's system ID
+            component_id: ack_info.target_component, // Use drone's component ID
+            sequence: 0,  // TODO: track sequence numbers per system
+        };
+
+        let msg = MavMessage::COMMAND_ACK(ack_data);
+
+        // Serialize to bytes
+        let mut buf = Vec::new();
+        mavlink::write_versioned_msg(&mut buf, MavlinkVersion::V2, header, &msg)
+            .expect("Failed to serialize COMMAND_ACK");
+
+        buf
     }
 
     /// Start the proxy server
@@ -164,11 +191,28 @@ impl ProxyServer {
                     } else {
                         // If we can't parse it, forward it anyway
                         debug!("Failed to parse message, forwarding anyway");
-                        ProcessResult::Forward
+                        ProcessResult {
+                            action: Action::Forward,
+                            ack_info: None,
+                        }
                     };
 
-                    match result {
-                        ProcessResult::Forward => {
+                    // Send COMMAND_ACK if auto_ack is enabled
+                    if let Some(ref ack_info) = result.ack_info {
+                        let ack_packet = Self::build_command_ack(ack_info);
+
+                        if let Err(e) = gcs_socket.send_to(&ack_packet, addr).await {
+                            error!("Failed to send COMMAND_ACK to GCS: {}", e);
+                        } else {
+                            info!(
+                                "Sent COMMAND_ACK to GCS (sysid={}, cmd={:?})",
+                                ack_info.target_system, ack_info.command
+                            );
+                        }
+                    }
+
+                    match result.action {
+                        Action::Forward => {
                             // Forward immediately
                             if let Err(e) = router_socket.send(packet).await {
                                 error!("Failed to forward to router: {}", e);
@@ -176,7 +220,7 @@ impl ProxyServer {
                                 debug!("Forwarded immediately");
                             }
                         }
-                        ProcessResult::Delay(duration) => {
+                        Action::Delay(duration) => {
                             // Spawn a task to delay and forward
                             let router_socket = router_socket.clone();
                             let packet = packet.to_vec();
@@ -198,7 +242,7 @@ impl ProxyServer {
 
                             // Loop continues immediately - other traffic flows normally
                         }
-                        ProcessResult::Block => {
+                        Action::Block => {
                             warn!("Message blocked by rule");
                         }
                     }

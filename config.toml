@@ -48,6 +48,7 @@ message_type = "COMMAND_LONG"
 command = "MAV_CMD_COMPONENT_ARM_DISARM"
 action = "delay"
 delay_seconds = 10
+auto_ack = true  # Send immediate COMMAND_ACK to GCS so it doesn't wait
 plugins = ["arm_notifier"]  # Execute these plugins when rule matches
 description = "Delay ARM commands by 10 seconds and notify Arduino"
 
@@ -121,4 +122,10 @@ param1 = 1.0
 #
 # Example plugin usage:
 # plugins = ["arm_notifier", "webhook_example"]
+#
+# AUTO-ACK FEATURE:
+# Set auto_ack = true on COMMAND_LONG rules to automatically send COMMAND_ACK
+# back to the GCS. This prevents the GCS from waiting for the delayed command
+# to complete. The ACK is sent immediately with MAV_RESULT_ACCEPTED.
+# Example: auto_ack = true
 # ============================================================================

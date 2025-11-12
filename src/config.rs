@@ -63,6 +63,10 @@ pub struct CommandRule {
     #[serde(default)]
     pub plugins: Vec<String>,
 
+    /// Optional: Automatically send COMMAND_ACK to GCS (for COMMAND_LONG messages)
+    #[serde(default)]
+    pub auto_ack: bool,
+
     /// Optional: Human-readable description
     pub description: Option<String>,
 

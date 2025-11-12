@@ -7,9 +7,23 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
+/// Information needed to send a COMMAND_ACK
+#[derive(Debug, Clone)]
+pub struct AckInfo {
+    pub command: mavlink::ardupilotmega::MavCmd,
+    pub target_system: u8,
+    pub target_component: u8,
+}
+
 /// Result of processing a message through the rule engine
 #[derive(Debug)]
-pub enum ProcessResult {
+pub struct ProcessResult {
+    pub action: Action,
+    pub ack_info: Option<AckInfo>,
+}
+
+#[derive(Debug)]
+pub enum Action {
     /// Forward the message immediately
     Forward,
     /// Delay the message by the specified duration
@@ -58,12 +72,15 @@ impl RuleEngine {
                 // Execute plugins for this rule
                 self.execute_plugins(rule, header, msg);
 
-                return self.execute_action(rule);
+                return self.execute_action(rule, msg);
             }
         }
 
         // No rule matched, forward by default
-        ProcessResult::Forward
+        ProcessResult {
+            action: Action::Forward,
+            ack_info: None,
+        }
     }
 
     /// Execute all plugins attached to a rule
@@ -219,24 +236,43 @@ impl RuleEngine {
     }
 
     /// Execute the action specified by a rule
-    fn execute_action(&self, rule: &CommandRule) -> ProcessResult {
-        match rule.action.as_str() {
+    fn execute_action(&self, rule: &CommandRule, msg: &MavMessage) -> ProcessResult {
+        // Build ACK info if auto_ack is enabled and this is a COMMAND_LONG
+        let ack_info = if rule.auto_ack {
+            match msg {
+                MavMessage::COMMAND_LONG(cmd) => Some(AckInfo {
+                    command: cmd.command,
+                    target_system: cmd.target_system,
+                    target_component: cmd.target_component,
+                }),
+                _ => {
+                    warn!("auto_ack enabled but message is not COMMAND_LONG, ignoring");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let action = match rule.action.as_str() {
             "delay" => {
                 let delay = Duration::from_secs(rule.delay_seconds.unwrap_or(0));
-                ProcessResult::Delay(delay)
+                Action::Delay(delay)
             }
-            "block" => ProcessResult::Block,
-            "forward" => ProcessResult::Forward,
+            "block" => Action::Block,
+            "forward" => Action::Forward,
             "modify" => {
                 // Future: implement message modification
                 info!("Modify action not yet implemented, forwarding");
-                ProcessResult::Forward
+                Action::Forward
             }
             _ => {
                 info!("Unknown action '{}', forwarding", rule.action);
-                ProcessResult::Forward
+                Action::Forward
             }
-        }
+        };
+
+        ProcessResult { action, ack_info }
     }
 }
 
