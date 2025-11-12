@@ -1,3 +1,4 @@
+mod batch;
 mod config;
 mod plugins;
 mod proxy;

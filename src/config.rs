@@ -27,6 +27,14 @@ fn default_plugins_dir() -> String {
     "plugins".to_string()
 }
 
+fn default_batch_timeout_forward() -> bool {
+    true
+}
+
+fn default_batch_key() -> String {
+    "default".to_string()
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct NetworkConfig {
     pub gcs_listen_port: u16,
@@ -58,6 +66,22 @@ pub struct CommandRule {
 
     /// Optional: Delay duration in seconds (for action = "delay")
     pub delay_seconds: Option<u64>,
+
+    /// Optional: Number of unique system IDs to wait for (for action = "batch")
+    pub batch_count: Option<usize>,
+
+    /// Optional: Timeout in seconds for batch completion (for action = "batch")
+    pub batch_timeout_seconds: Option<u64>,
+
+    /// Optional: Whether to forward messages on timeout (for action = "batch")
+    /// If false, messages are dropped on timeout. Default: true
+    #[serde(default = "default_batch_timeout_forward")]
+    pub batch_timeout_forward: bool,
+
+    /// Optional: Batch group key (for action = "batch")
+    /// Allows multiple independent batch groups. Default: "default"
+    #[serde(default = "default_batch_key")]
+    pub batch_key: String,
 
     /// Optional: List of plugins to execute when this rule matches
     #[serde(default)]
@@ -120,9 +144,9 @@ impl Config {
 
         // Validate rules
         for (idx, rule) in self.rules.iter().enumerate() {
-            if !["delay", "block", "forward", "modify"].contains(&rule.action.as_str()) {
+            if !["delay", "block", "forward", "modify", "batch"].contains(&rule.action.as_str()) {
                 anyhow::bail!(
-                    "Rule {} has invalid action '{}'. Must be: delay, block, forward, or modify",
+                    "Rule {} has invalid action '{}'. Must be: delay, block, forward, modify, or batch",
                     idx,
                     rule.action
                 );
@@ -133,6 +157,21 @@ impl Config {
                     "Rule {} has action 'delay' but no delay_seconds specified",
                     idx
                 );
+            }
+
+            if rule.action == "batch" {
+                if rule.batch_count.is_none() {
+                    anyhow::bail!(
+                        "Rule {} has action 'batch' but no batch_count specified",
+                        idx
+                    );
+                }
+                if rule.batch_timeout_seconds.is_none() {
+                    anyhow::bail!(
+                        "Rule {} has action 'batch' but no batch_timeout_seconds specified",
+                        idx
+                    );
+                }
             }
         }
 

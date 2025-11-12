@@ -30,6 +30,13 @@ pub enum Action {
     Delay(Duration),
     /// Block the message completely
     Block,
+    /// Batch messages until threshold is met or timeout occurs
+    Batch {
+        count: usize,
+        timeout: Duration,
+        key: String,
+        forward_on_timeout: bool,
+    },
     // Future: Modify could include modified packet data
     // Modify(Vec<u8>),
 }
@@ -258,6 +265,18 @@ impl RuleEngine {
             "delay" => {
                 let delay = Duration::from_secs(rule.delay_seconds.unwrap_or(0));
                 Action::Delay(delay)
+            }
+            "batch" => {
+                let count = rule.batch_count.unwrap_or(1);
+                let timeout = Duration::from_secs(rule.batch_timeout_seconds.unwrap_or(30));
+                let key = rule.batch_key.clone();
+                let forward_on_timeout = rule.batch_timeout_forward;
+                Action::Batch {
+                    count,
+                    timeout,
+                    key,
+                    forward_on_timeout,
+                }
             }
             "block" => Action::Block,
             "forward" => Action::Forward,

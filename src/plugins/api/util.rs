@@ -36,7 +36,7 @@ pub fn init(lua: &Lua) -> Result<()> {
             match std::fs::read_to_string(&path) {
                 Ok(content) => lua.create_string(&content)
                     .map(mlua::Value::String)
-                    .map_err(|e| mlua::Error::external(e)),
+                    .map_err(mlua::Error::external),
                 Err(e) => {
                     tracing::warn!("[Plugin] Failed to read file {}: {}", path, e);
                     Ok(mlua::Value::Nil)

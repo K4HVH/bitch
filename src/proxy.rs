@@ -1,3 +1,4 @@
+use crate::batch::{BatchManager, BatchResult};
 use crate::config::Config;
 use crate::plugins::PluginManager;
 use crate::rules::{parse_mavlink_message, Action, AckInfo, ProcessResult, RuleEngine};
@@ -14,12 +15,14 @@ use tracing::{debug, error, info, warn};
 /// Shared state for the proxy
 pub struct ProxyState {
     gcs_addr: RwLock<Option<SocketAddr>>,
+    batch_manager: BatchManager,
 }
 
 impl ProxyState {
     pub fn new() -> Self {
         Self {
             gcs_addr: RwLock::new(None),
+            batch_manager: BatchManager::new(),
         }
     }
 }
@@ -241,6 +244,59 @@ impl ProxyServer {
                             });
 
                             // Loop continues immediately - other traffic flows normally
+                        }
+                        Action::Batch {
+                            count,
+                            timeout,
+                            key,
+                            forward_on_timeout,
+                        } => {
+                            // Queue packet in batch manager
+                            let packet = packet.to_vec();
+
+                            // Extract the target system ID from the message
+                            // For COMMAND_LONG, this is the drone being commanded, not the GCS
+                            let system_id = if let Ok((header, msg)) = parse_mavlink_message(&packet) {
+                                match msg {
+                                    MavMessage::COMMAND_LONG(cmd) => cmd.target_system,
+                                    _ => header.system_id,
+                                }
+                            } else {
+                                // If we can't parse, use 0 as fallback
+                                0
+                            };
+
+                            let batch_result = state
+                                .batch_manager
+                                .queue_or_release(
+                                    key.clone(),
+                                    system_id,
+                                    packet,
+                                    count,
+                                    timeout,
+                                    forward_on_timeout,
+                                    router_socket.clone(),
+                                )
+                                .await;
+
+                            match batch_result {
+                                BatchResult::Queued => {
+                                    // Packet queued, continue processing other messages
+                                }
+                                BatchResult::Release(packets) => {
+                                    // Threshold met, forward all packets
+                                    info!(
+                                        "Batch '{}' threshold met, forwarding {} packets",
+                                        key,
+                                        packets.len()
+                                    );
+                                    for packet in packets {
+                                        if let Err(e) = router_socket.send(&packet).await {
+                                            error!("Failed to forward batch packet: {}", e);
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Action::Block => {
                             warn!("Message blocked by rule");

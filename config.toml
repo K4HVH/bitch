@@ -27,7 +27,7 @@ arm_notifier = "arm_notifier.lua"
 # Rules are processed in priority order (highest priority first).
 # The first matching rule determines the action for a message.
 #
-# Available actions: "delay", "block", "forward", "modify"
+# Available actions: "delay", "block", "forward", "modify", "batch"
 # Available message_type: "COMMAND_LONG", "HEARTBEAT", "MISSION_ITEM", etc.
 #
 # For COMMAND_LONG, specify the command name:
@@ -41,16 +41,19 @@ arm_notifier = "arm_notifier.lua"
 # Note: Messages that don't match any rule are forwarded immediately by default
 # ============================================================================
 
-# Delay ARM commands by 10 seconds and execute plugins
+# Batch ARM commands across multiple drones
 # (DISARM commands with param1=0.0 won't match this rule and pass through immediately)
 [[rules]]
 message_type = "COMMAND_LONG"
 command = "MAV_CMD_COMPONENT_ARM_DISARM"
-action = "delay"
-delay_seconds = 10
-auto_ack = true  # Send immediate COMMAND_ACK to GCS so it doesn't wait
-plugins = ["arm_notifier"]  # Execute these plugins when rule matches
-description = "Delay ARM commands by 10 seconds and notify Arduino"
+action = "batch"
+batch_count = 2                    # Wait for 2 unique drones to send ARM
+batch_timeout_seconds = 60         # Timeout after 60 seconds
+batch_timeout_forward = true       # Forward on timeout even if threshold not met
+batch_key = "arm_swarm"           # Batch group identifier
+auto_ack = true                   # Send immediate COMMAND_ACK to GCS so it doesn't wait
+plugins = ["arm_notifier"]        # Execute these plugins when rule matches
+description = "Synchronize ARM commands across 2 drones"
 
 [rules.conditions]
 param1 = 1.0
@@ -128,4 +131,33 @@ param1 = 1.0
 # back to the GCS. This prevents the GCS from waiting for the delayed command
 # to complete. The ACK is sent immediately with MAV_RESULT_ACCEPTED.
 # Example: auto_ack = true
+#
+# BATCH FEATURE:
+# Set action = "batch" to synchronize commands across multiple drones.
+# The batch system waits until N unique system IDs send the matching command,
+# then forwards all queued messages simultaneously.
+#
+# Required fields for batch action:
+#   batch_count             - Number of unique system IDs to wait for
+#   batch_timeout_seconds   - Maximum time to wait before timeout
+#
+# Optional fields:
+#   batch_timeout_forward   - Forward on timeout (default: true) or drop
+#   batch_key              - Batch group identifier (default: "default")
+#                            Use different keys for independent batch groups
+#
+# Example: Synchronize arming across 3 drones
+# [[rules]]
+# message_type = "COMMAND_LONG"
+# command = "MAV_CMD_COMPONENT_ARM_DISARM"
+# action = "batch"
+# batch_count = 3
+# batch_timeout_seconds = 30
+# batch_timeout_forward = true
+# batch_key = "arm_swarm"
+# auto_ack = true
+# description = "Synchronize ARM commands across 3 drones"
+#
+# [rules.conditions]
+# param1 = 1.0  # Only ARM (not DISARM)
 # ============================================================================

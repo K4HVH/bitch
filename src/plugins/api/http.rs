@@ -14,7 +14,7 @@ pub fn init(lua: &Lua) -> Result<()> {
             match http_get(&url).await {
                 Ok(body) => lua.create_string(&body)
                     .map(mlua::Value::String)
-                    .map_err(|e| mlua::Error::external(e)),
+                    .map_err(mlua::Error::external),
                 Err(e) => {
                     warn!("[Plugin] HTTP GET to {} failed: {}", url, e);
                     Ok(mlua::Value::Nil)
@@ -30,7 +30,7 @@ pub fn init(lua: &Lua) -> Result<()> {
             match http_post(&url, body).await {
                 Ok(response) => lua.create_string(&response)
                     .map(mlua::Value::String)
-                    .map_err(|e| mlua::Error::external(e)),
+                    .map_err(mlua::Error::external),
                 Err(e) => {
                     warn!("[Plugin] HTTP POST to {} failed: {}", url, e);
                     Ok(mlua::Value::Nil)
