@@ -12,12 +12,13 @@ A powerful MAVLink proxy that intercepts and transforms messages between Ground 
 3. [Installation & Usage](#installation--usage)
 4. [Configuration System](#configuration-system)
 5. [Rules System](#rules-system)
-6. [Modifier System](#modifier-system)
-7. [Plugin System](#plugin-system)
-8. [Advanced Examples](#advanced-examples)
-9. [Technical Details](#technical-details)
-10. [Development](#development)
-11. [Troubleshooting](#troubleshooting)
+6. [Trigger System](#trigger-system)
+7. [Modifier System](#modifier-system)
+8. [Plugin System](#plugin-system)
+9. [Advanced Examples](#advanced-examples)
+10. [Technical Details](#technical-details)
+11. [Development](#development)
+12. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -41,6 +42,7 @@ Both directions support all actions: forward, block, modify, delay, and batch.
 - **Transparent bidirectional UDP proxy** between GCS and mavlink-router
 - **MAVLink message parsing** (supports both v1 and v2)
 - **Rule-based filtering system** with conditions, priorities, and direction control
+- **Trigger system** - Rules can activate/deactivate other rules dynamically
 - **Flexible actions**: delay, block, forward, modify, batch
 - **Generic message support** - Works with ALL 300+ MAVLink message types
 - **Conditional matching** on ANY message field
@@ -49,6 +51,7 @@ Both directions support all actions: forward, block, modify, delay, and batch.
 - **Lua scripting** for modifiers and plugins (unified API)
 - **Batch synchronization** across multiple drones with configurable field extraction
 - **Generic Auto-ACK** for ANY message type (not just COMMAND_LONG)
+- **Command chaining** - Actions execute sequentially through the entire chain
 - **Async/non-blocking operation** using Tokio
 - **Detailed logging** with tracing
 
@@ -139,10 +142,12 @@ Rules are the core of BITCH, allowing you to intercept, modify, delay, or block 
 
 ```toml
 [[rules]]
+name = "my_rule"                 # Unique rule identifier (required)
 message_type = "MESSAGE_TYPE"    # Which message type to match (required)
 priority = 10                    # Higher = checked first (default: 0)
 actions = ["action1", "action2"] # Sequential actions to apply (required)
 direction = "gcs_to_router"      # Flow direction (default: "gcs_to_router")
+enabled_by_default = true        # Whether rule is active on startup (default: true)
 description = "What this rule does"
 
 [rules.conditions]               # Match specific message fields (optional)
@@ -380,6 +385,286 @@ chan1_raw = 1500
 - **Strings**: Exact match
 - **Booleans**: Exact match
 - **Enums**: Internally-tagged format (e.g., `{ type = "MAV_CMD_..." }`)
+
+---
+
+## Trigger System
+
+The trigger system allows rules to dynamically activate or deactivate other rules when they match. This enables powerful conditional logic like "when drones ARM, activate the always_armed modifier for 60 seconds."
+
+### Overview
+
+**Key Features:**
+- Rules can activate/deactivate other rules by name
+- Time-limited activations with automatic expiration
+- Multiple rules can be triggered simultaneously
+- Cascading triggers (triggered rules can have their own triggers)
+- Configurable timing (on match or on complete)
+
+**Use Cases:**
+- Temporarily enable rules for a duration after an event
+- Create state machines with rule activation chains
+- Conditionally enable modifiers based on commands
+- Coordinate multiple rule behaviors dynamically
+
+### Trigger Configuration
+
+Add a `[rules.triggers]` section to any rule:
+
+```toml
+[[rules]]
+name = "arm_command"
+message_type = "COMMAND_LONG"
+actions = ["batch", "delay"]
+# ... other rule config ...
+
+[rules.triggers]
+activate_rules = ["show_always_armed", "extra_logging"]  # Rules to enable
+deactivate_rules = ["block_telemetry"]                   # Rules to disable
+duration_seconds = 60                                     # How long to keep activated
+on_match = true                                           # Trigger when rule matches (default)
+on_complete = false                                       # Trigger after actions complete (default)
+
+[rules.conditions]
+command = { type = "MAV_CMD_COMPONENT_ARM_DISARM" }
+param1 = 1.0
+```
+
+### Trigger Fields
+
+#### activate_rules (array of strings)
+List of rule names to enable when this rule triggers.
+
+```toml
+activate_rules = ["rule1", "rule2", "rule3"]
+```
+
+- Rules must exist (validated at startup)
+- Multiple rules can be activated simultaneously
+- Activated rules start processing immediately
+
+#### deactivate_rules (array of strings)
+List of rule names to disable when this rule triggers.
+
+```toml
+deactivate_rules = ["rule_to_stop"]
+```
+
+- Immediately disables the specified rules
+- Rules stop matching new messages
+- Does not affect already-queued messages in delays/batches
+
+#### duration_seconds (optional integer)
+How long to keep activated rules enabled (in seconds).
+
+```toml
+duration_seconds = 60  # Keep active for 60 seconds
+```
+
+- Only applies to `activate_rules`
+- After duration expires, rules automatically deactivate
+- Background cleanup task runs every 1 second
+- If omitted, activated rules stay enabled permanently
+
+#### on_match (boolean, default: true)
+Trigger when the rule matches a message.
+
+```toml
+on_match = true  # Trigger immediately when rule matches
+```
+
+- Triggers before actions execute
+- Useful for event-based activation
+
+#### on_complete (boolean, default: false)
+Trigger after all actions complete.
+
+```toml
+on_complete = true  # Trigger after delay/batch finishes
+```
+
+- Triggers after the entire action chain completes
+- Useful for sequencing rules
+- **Note:** Currently only `on_match` is fully implemented
+
+### Rule State Management
+
+#### enabled_by_default (boolean, default: true)
+Whether a rule is active when BITCH starts.
+
+```toml
+[[rules]]
+name = "triggered_rule"
+enabled_by_default = false  # Disabled until another rule activates it
+# ... rest of rule config ...
+```
+
+- `true`: Rule is active on startup (default)
+- `false`: Rule is disabled until explicitly activated by a trigger
+- Useful for rules that should only run conditionally
+
+#### Rule Names (required)
+Every rule must have a unique name.
+
+```toml
+[[rules]]
+name = "my_unique_rule"  # Required for trigger system
+```
+
+- Used to reference rules in triggers
+- Must be unique across all rules
+- Validated at startup (error if duplicate names)
+
+### Timer Behavior
+
+**Multiple Triggers:**
+When a rule is triggered multiple times, **the timer resets**.
+
+Example:
+```
+T=0s:  ARM command 1 → activates "show_always_armed" until T=60s
+T=5s:  ARM command 2 → resets timer, now active until T=65s
+T=10s: ARM command 3 → resets timer, now active until T=70s
+```
+
+The rule stays active until `duration_seconds` after the **last** trigger.
+
+**Auto Cleanup:**
+- Background task runs every 1 second
+- Expired rule activations are automatically removed
+- Deactivated rules stop processing immediately
+- Logged with debug messages
+
+### Cascading Triggers
+
+Triggered rules can have their own triggers, creating chains:
+
+```toml
+[[rules]]
+name = "initial_rule"
+message_type = "COMMAND_LONG"
+actions = ["forward"]
+
+[rules.triggers]
+activate_rules = ["second_rule"]
+on_match = true
+
+[rules.conditions]
+command = { type = "MAV_CMD_COMPONENT_ARM_DISARM" }
+
+[[rules]]
+name = "second_rule"
+message_type = "HEARTBEAT"
+enabled_by_default = false
+actions = ["modify", "forward"]
+modifier = "always_armed"
+
+[rules.triggers]
+activate_rules = ["third_rule"]  # This rule can also trigger others!
+duration_seconds = 30
+on_match = true
+```
+
+### Complete Example: ARM-Activated Modifier
+
+```toml
+# Rule 1: ARM command handler with trigger
+[[rules]]
+name = "arm_sync"
+message_type = "COMMAND_LONG"
+actions = ["batch", "delay"]
+batch_count = 2
+batch_timeout_seconds = 60
+batch_timeout_forward = true
+batch_key = "arm_swarm"
+batch_system_id_field = "target_system"
+delay_seconds = 5
+auto_ack = true
+plugins = ["arm_notifier"]
+direction = "gcs_to_router"
+description = "Synchronize ARM commands across 2 drones, then delay 5s before arming"
+
+[rules.conditions]
+command = { type = "MAV_CMD_COMPONENT_ARM_DISARM" }
+param1 = 1.0
+
+[rules.ack]
+message_type = "COMMAND_ACK"
+source_system_field = "target_system"
+source_component_field = "target_component"
+fields = { result = { type = "MAV_RESULT_ACCEPTED" } }
+copy_fields = { command = "command", target_system = "header.system_id", target_component = "header.component_id" }
+
+# Trigger: Activate always_armed rule for 60 seconds when drones ARM
+[rules.triggers]
+activate_rules = ["show_always_armed"]
+duration_seconds = 60
+on_match = true
+
+# Rule 2: Always armed modifier (disabled by default, activated by trigger)
+[[rules]]
+name = "show_always_armed"
+message_type = "HEARTBEAT"
+actions = ["modify", "forward"]
+modifier = "always_armed"
+direction = "router_to_gcs"
+enabled_by_default = false
+description = "Show drones as always armed (activated by ARM trigger)"
+```
+
+**How it works:**
+1. GCS sends ARM command
+2. `arm_sync` rule matches
+3. Trigger activates `show_always_armed` for 60 seconds
+4. For 60 seconds, all HEARTBEAT messages show drones as armed
+5. After 60 seconds, `show_always_armed` automatically deactivates
+6. HEARTBEAT messages return to normal
+
+### Manual Deactivation Example
+
+Use deactivation rules to manually stop rules:
+
+```toml
+# Rule that activates on ARM
+[[rules]]
+name = "arm_handler"
+message_type = "COMMAND_LONG"
+actions = ["forward"]
+direction = "gcs_to_router"
+
+[rules.conditions]
+command = { type = "MAV_CMD_COMPONENT_ARM_DISARM" }
+param1 = 1.0  # ARM
+
+[rules.triggers]
+activate_rules = ["show_always_armed"]
+duration_seconds = 120
+on_match = true
+
+# Rule that deactivates on DISARM
+[[rules]]
+name = "disarm_handler"
+message_type = "COMMAND_LONG"
+actions = ["forward"]
+direction = "gcs_to_router"
+
+[rules.conditions]
+command = { type = "MAV_CMD_COMPONENT_ARM_DISARM" }
+param1 = 0.0  # DISARM
+
+[rules.triggers]
+deactivate_rules = ["show_always_armed"]  # Stop showing armed immediately
+on_match = true
+
+# The modifier rule
+[[rules]]
+name = "show_always_armed"
+message_type = "HEARTBEAT"
+actions = ["modify", "forward"]
+modifier = "always_armed"
+direction = "router_to_gcs"
+enabled_by_default = false
+```
 
 ---
 
@@ -664,12 +949,13 @@ end
 
 ## Advanced Examples
 
-### Example 1: Synchronize ARM Across Swarm
+### Example 1: Synchronize ARM Across Swarm with Trigger
 
-Batch ARM commands from multiple drones, delay, then forward:
+Batch ARM commands from multiple drones, delay, then forward, and activate a modifier:
 
 ```toml
 [[rules]]
+name = "arm_swarm_sync"
 message_type = "COMMAND_LONG"
 actions = ["batch", "delay"]
 batch_count = 3                          # Wait for 3 drones
@@ -693,6 +979,11 @@ source_system_field = "target_system"
 source_component_field = "target_component"
 fields = { result = { type = "MAV_RESULT_ACCEPTED" } }
 copy_fields = { command = "command" }
+
+[rules.triggers]
+activate_rules = ["show_armed_status"]
+duration_seconds = 120
+on_match = true
 ```
 
 ### Example 2: Block Emergency LAND Commands
@@ -701,6 +992,7 @@ Prevent emergency land from specific system:
 
 ```toml
 [[rules]]
+name = "block_emergency_land"
 message_type = "COMMAND_LONG"
 actions = ["block"]
 priority = 100  # High priority
@@ -719,10 +1011,12 @@ Make all drones appear armed:
 
 ```toml
 [[rules]]
+name = "show_always_armed"
 message_type = "HEARTBEAT"
 actions = ["modify", "forward"]
 modifier = "always_armed"
 direction = "router_to_gcs"
+enabled_by_default = false  # Only enable when triggered
 description = "Show drones as always armed"
 ```
 
@@ -732,6 +1026,7 @@ Add 1 second delay to GPS messages:
 
 ```toml
 [[rules]]
+name = "delay_gps_fix"
 message_type = "GPS_RAW_INT"
 actions = ["delay"]
 delay_seconds = 1
@@ -748,6 +1043,7 @@ Filter out error STATUSTEXT messages:
 
 ```toml
 [[rules]]
+name = "block_errors"
 message_type = "STATUSTEXT"
 actions = ["block"]
 direction = "router_to_gcs"
@@ -763,6 +1059,7 @@ Synchronize mission uploads:
 
 ```toml
 [[rules]]
+name = "mission_sync"
 message_type = "MISSION_ITEM_INT"
 actions = ["batch"]
 batch_count = 5                          # Wait for 5 drones
@@ -779,6 +1076,7 @@ Immediately acknowledge mission list requests:
 
 ```toml
 [[rules]]
+name = "ack_mission_requests"
 message_type = "MISSION_REQUEST_LIST"
 actions = ["delay"]
 delay_seconds = 2
@@ -804,19 +1102,24 @@ fields = { count = 0, mission_type = { type = "MAV_MISSION_TYPE_MISSION" } }
 2. Parse MAVLink (v2/v1)
 3. Extract message type
 4. Find matching rule (priority order)
+   - Check if rule is enabled
    - Check direction
    - Check message_type
    - Check conditions (ALL fields generic)
-5. Execute plugins (if any)
-6. Build action sequence
-7. Execute modifiers (if modify action)
-8. Send ACK (if auto_ack)
-9. Execute actions recursively:
-   - Forward → send packet
-   - Block → drop packet
-   - Modify → reconstruct packet
-   - Delay → spawn async task
-   - Batch → queue or release
+5. Execute triggers (if on_match = true)
+   - Activate/deactivate rules
+   - Set expiration timers
+6. Execute plugins (if any)
+7. Build action sequence
+8. Execute modifiers (if modify action)
+9. Send ACK (if auto_ack)
+10. Execute actions recursively (command chaining):
+    - Forward → send packet
+    - Block → drop packet
+    - Modify → reconstruct packet
+    - Delay → spawn async task
+    - Batch → queue or release, then continue chain
+    - All actions maintain the remaining action chain
 ```
 
 ### Rule Processing
@@ -849,9 +1152,10 @@ actions = ["modify", "batch", "delay", "forward"]
 - Batch removed from memory
 
 **Timeout:**
-- If `batch_timeout_forward = true`: Forward all packets directly (no remaining actions)
+- If `batch_timeout_forward = true`: Forward all packets and apply remaining actions in the chain
 - If `batch_timeout_forward = false`: Drop all packets
 - Warning logged with statistics
+- Remaining actions (like delay) are applied even on timeout!
 
 ### Auto-ACK Behavior
 
@@ -964,6 +1268,17 @@ strip target/release/bitch
 - Verify `message_type` is correct (check logs with `RUST_LOG=debug`)
 - Ensure conditions match (check field values in logs)
 - Check rule priority (higher priority rules checked first)
+- **Check if rule is disabled** - Look for "Rule 'X' is disabled, skipping" in logs
+- Verify `enabled_by_default = true` or that rule has been activated by a trigger
+
+### Trigger System Issues
+
+- **Rule not activating:** Check trigger rule is matching (look for "Rule matched" logs)
+- **Duplicate rule names:** All rules must have unique names (error on startup)
+- **Referenced rule doesn't exist:** Triggers validate at startup - check for errors
+- **Timer not expiring:** Background cleanup runs every 1 second, check logs for "Rule 'X' activation expired"
+- **Rule stays active too long:** Each trigger resets the timer - check if rule is being repeatedly triggered
+- **Cascading triggers not working:** Ensure triggered rules have `enabled_by_default = false` and are being activated
 
 ### Lua Script Errors
 

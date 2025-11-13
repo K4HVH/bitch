@@ -26,20 +26,25 @@ Edit `config.toml` to define rules for intercepting and transforming MAVLink mes
 
 See `DOCUMENTATION.md` for complete documentation including:
 - Rule system with conditions and priorities
+- **Trigger system** (rules can activate/deactivate other rules)
 - Modifiers (Lua scripts for transforming messages)
 - Plugins (Lua scripts for side effects)
 - Batch synchronization across drones
+- Command chaining (actions execute sequentially)
+- Auto-ACK system (generic for all message types)
 - Bidirectional message processing
 - All 300+ MAVLink message types
 
 ## Features
 
 - Bidirectional UDP proxy (GCS ↔ Router)
-- Rule-based message filtering
-- Actions: forward, block, modify, delay, batch
+- Rule-based message filtering with priorities
+- **Trigger system** - Dynamic rule activation/deactivation
+- Actions: forward, block, modify, delay, batch (with command chaining)
 - Direction control: gcs_to_router, router_to_gcs, both
+- Auto-ACK system (generic for all message types)
 - Lua scripting for modifiers and plugins
-- Priority-based rule processing
+- Batch synchronization across multiple drones
 - Async/non-blocking operation
 
 ## License
