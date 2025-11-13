@@ -5,25 +5,33 @@
 function modify(ctx)
     local msg = ctx.message
 
-    -- base_mode is a table/enum with a 'bits' field containing the actual value
-    if msg.base_mode and msg.base_mode.bits then
-        local original_mode = msg.base_mode.bits
-        
-        -- MAV_MODE_FLAG_SAFETY_ARMED = 128 (0x80)
-        -- Set bit 7 to indicate armed
-        local armed_bit = 128
-        local new_mode = original_mode | armed_bit
+    -- Messages are serialized as {MESSAGE_TYPE = {fields...}}
+    if msg.HEARTBEAT then
+        local hb = msg.HEARTBEAT
 
-        -- Only log if we're actually changing the value
-        if original_mode ~= new_mode then
-            log.info(string.format("Setting armed bit on sys=%d: base_mode %d -> %d (0x%02X -> 0x%02X)", 
-                ctx.system_id, original_mode, new_mode, original_mode, new_mode))
+        -- base_mode is a table/enum with a 'bits' field containing the actual value
+        if hb.base_mode and hb.base_mode.bits then
+            local original_mode = hb.base_mode.bits
+
+            -- MAV_MODE_FLAG_SAFETY_ARMED = 128 (0x80)
+            -- Set bit 7 to indicate armed
+            local armed_bit = 128
+            local new_mode = original_mode | armed_bit
+
+            -- Only log if we're actually changing the value
+            if original_mode ~= new_mode then
+                log.info(string.format("Setting armed bit on sys=%d: base_mode %d -> %d (0x%02X -> 0x%02X)",
+                    ctx.system_id, original_mode, new_mode, original_mode, new_mode))
+            end
+
+            hb.base_mode.bits = new_mode
+            msg.HEARTBEAT = hb
+            ctx.message = msg
+        else
+            log.error("Could not access base_mode.bits field in HEARTBEAT message")
         end
-
-        msg.base_mode.bits = new_mode
-        ctx.message = msg
     else
-        log.error("Could not access base_mode.bits field in HEARTBEAT message")
+        log.error(string.format("Expected HEARTBEAT, got message_type: %s", ctx.message_type))
     end
 
     return ctx

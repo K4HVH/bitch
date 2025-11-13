@@ -4,7 +4,7 @@ use crate::modifiers::ModifierManager;
 use crate::plugins::PluginManager;
 use crate::rules::{parse_mavlink_message, Action, AckInfo, ProcessResult, RuleEngine};
 use anyhow::{Context, Result};
-use mavlink::ardupilotmega::{MavMessage, COMMAND_ACK_DATA};
+use mavlink::ardupilotmega::MavMessage;
 use mavlink::{MavHeader, MavlinkVersion};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -173,6 +173,7 @@ impl ProxyServer {
                 timeout,
                 key,
                 forward_on_timeout,
+                system_id_field,
             } => {
                 // Batch action only makes sense for single packets
                 if packets.len() != 1 {
@@ -181,11 +182,14 @@ impl ProxyServer {
 
                 let packet = packets.into_iter().next().unwrap();
 
-                // Extract system ID
+                // Extract system ID (generic for all message types)
                 let system_id = if let Ok((header, msg)) = parse_mavlink_message(&packet) {
-                    match msg {
-                        MavMessage::COMMAND_LONG(cmd) => cmd.target_system,
-                        _ => header.system_id,
+                    if let Some(ref field_name) = system_id_field {
+                        // Extract from specified message field
+                        Self::extract_system_id_from_message(&msg, field_name).unwrap_or(header.system_id)
+                    } else {
+                        // Default: use header system_id
+                        header.system_id
                     }
                 } else {
                     0
@@ -234,29 +238,67 @@ impl ProxyServer {
         })
     }
 
-    /// Build a COMMAND_ACK message
-    fn build_command_ack(ack_info: &AckInfo) -> Vec<u8> {
-        let ack_data = COMMAND_ACK_DATA {
-            command: ack_info.command,
-            result: mavlink::ardupilotmega::MavResult::MAV_RESULT_ACCEPTED,
-        };
+    /// Extract system_id from a message field generically
+    fn extract_system_id_from_message(msg: &MavMessage, field_name: &str) -> Option<u8> {
+        // Serialize message to JSON to extract field
+        let msg_json = serde_json::to_value(msg).ok()?;
 
-        // CRITICAL: The ACK must appear to come FROM the target system (drone),
-        // not from the proxy. This is what Mission Planner expects.
+        // Get message type name
+        let msg_type_str = format!("{:?}", msg);
+        let msg_type = msg_type_str.split('(').next().unwrap_or("UNKNOWN");
+        let msg_data = msg_json.get(msg_type)?;
+
+        // Extract field value
+        let field_value = msg_data.get(field_name)?;
+        field_value.as_u64().map(|v| v as u8)
+    }
+
+    /// Build a generic ACK message (works for ANY message type)
+    fn build_ack(ack_info: &AckInfo) -> Result<Vec<u8>> {
+        // Convert TOML values to JSON values for serde
+        let mut fields_json = serde_json::Map::new();
+        for (key, value) in &ack_info.fields {
+            let json_value = match value {
+                toml::Value::String(s) => serde_json::Value::String(s.clone()),
+                toml::Value::Integer(i) => serde_json::Value::Number((*i).into()),
+                toml::Value::Float(f) => {
+                    serde_json::Number::from_f64(*f)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null)
+                }
+                toml::Value::Boolean(b) => serde_json::Value::Bool(*b),
+                _ => {
+                    warn!("Unsupported TOML value type in ack_fields");
+                    continue;
+                }
+            };
+            fields_json.insert(key.clone(), json_value);
+        }
+
+        // Build message structure: {MESSAGE_TYPE: {fields...}}
+        let mut msg_json = serde_json::Map::new();
+        msg_json.insert(
+            ack_info.message_type.clone(),
+            serde_json::Value::Object(fields_json),
+        );
+
+        // Deserialize to MavMessage
+        let msg: MavMessage = serde_json::from_value(serde_json::Value::Object(msg_json))
+            .context("Failed to deserialize ACK message from fields")?;
+
+        // Build header - ACK appears to come FROM the target system
         let header = MavHeader {
-            system_id: ack_info.target_system,     // Use drone's system ID
-            component_id: ack_info.target_component, // Use drone's component ID
-            sequence: 0,  // TODO: track sequence numbers per system
+            system_id: ack_info.source_system,
+            component_id: ack_info.source_component,
+            sequence: 0, // TODO: track sequence numbers per system
         };
-
-        let msg = MavMessage::COMMAND_ACK(ack_data);
 
         // Serialize to bytes
         let mut buf = Vec::new();
         mavlink::write_versioned_msg(&mut buf, MavlinkVersion::V2, header, &msg)
-            .expect("Failed to serialize COMMAND_ACK");
+            .context("Failed to serialize ACK message")?;
 
-        buf
+        Ok(buf)
     }
 
     /// Start the proxy server
@@ -275,12 +317,8 @@ impl ProxyServer {
         for rule in &self.config.rules {
             let actions_str = rule.get_actions().join(" -> ");
             info!(
-                "   - {} {} -> {} {}",
+                "   - {} -> {} {}",
                 rule.message_type,
-                rule.command
-                    .as_ref()
-                    .map(|cmd| format!("({})", cmd))
-                    .unwrap_or_default(),
                 actions_str,
                 rule.delay_seconds
                     .map(|d| format!("({}s)", d))
@@ -391,17 +429,22 @@ impl ProxyServer {
                         }
                     };
 
-                    // Send COMMAND_ACK if auto_ack is enabled
+                    // Send ACK if auto_ack is enabled (works for ANY message type)
                     if let Some(ref ack_info) = result.ack_info {
-                        let ack_packet = Self::build_command_ack(ack_info);
-
-                        if let Err(e) = gcs_socket.send_to(&ack_packet, addr).await {
-                            error!("Failed to send COMMAND_ACK to GCS: {}", e);
-                        } else {
-                            info!(
-                                "Sent COMMAND_ACK to GCS (sysid={}, cmd={:?})",
-                                ack_info.target_system, ack_info.command
-                            );
+                        match Self::build_ack(ack_info) {
+                            Ok(ack_packet) => {
+                                if let Err(e) = gcs_socket.send_to(&ack_packet, addr).await {
+                                    error!("Failed to send {} to GCS: {}", ack_info.message_type, e);
+                                } else {
+                                    info!(
+                                        "Sent {} to GCS (sysid={})",
+                                        ack_info.message_type, ack_info.source_system
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to build {} message: {}", ack_info.message_type, e);
+                            }
                         }
                     }
 
@@ -454,6 +497,25 @@ impl ProxyServer {
                                 ack_info: None,
                             }
                         };
+
+                        // Send ACK if auto_ack is enabled (works for ANY message type)
+                        if let Some(ref ack_info) = result.ack_info {
+                            match Self::build_ack(ack_info) {
+                                Ok(ack_packet) => {
+                                    if let Err(e) = router_socket.send(&ack_packet).await {
+                                        error!("Failed to send {} to router: {}", ack_info.message_type, e);
+                                    } else {
+                                        info!(
+                                            "Sent {} to router (sysid={})",
+                                            ack_info.message_type, ack_info.source_system
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to build {} message: {}", ack_info.message_type, e);
+                                }
+                            }
+                        }
 
                         // Execute action sequence (router->GCS direction)
                         Self::execute_actions(

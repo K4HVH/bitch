@@ -5,16 +5,22 @@ use anyhow::Result;
 use mavlink::ardupilotmega::MavMessage;
 use mavlink::MavHeader;
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-/// Information needed to send a COMMAND_ACK
+/// Information needed to send a generic ACK message
 #[derive(Debug, Clone)]
 pub struct AckInfo {
-    pub command: mavlink::ardupilotmega::MavCmd,
-    pub target_system: u8,
-    pub target_component: u8,
+    /// The message type to send (e.g., "COMMAND_ACK", "MISSION_ACK")
+    pub message_type: String,
+    /// Source system_id for the ACK (extracted from matched message)
+    pub source_system: u8,
+    /// Source component_id for the ACK (extracted from matched message)
+    pub source_component: u8,
+    /// Fields to set in the ACK message (generic key-value pairs)
+    pub fields: HashMap<String, toml::Value>,
 }
 
 /// Result of processing a message through the rule engine
@@ -38,6 +44,9 @@ pub enum Action {
         timeout: Duration,
         key: String,
         forward_on_timeout: bool,
+        /// Optional: Field name in message to extract system_id from (e.g., "target_system")
+        /// If None, uses header.system_id
+        system_id_field: Option<String>,
     },
     /// Modify the message using a Lua modifier script
     Modify {
@@ -90,12 +99,8 @@ impl RuleEngine {
         for rule in &self.rules {
             if self.matches_rule(header, msg, rule, direction) {
                 info!(
-                    "Rule matched: {} {} - {}",
+                    "Rule matched: {} - {}",
                     rule.message_type,
-                    rule.command
-                        .as_ref()
-                        .map(|cmd| format!("({})", cmd))
-                        .unwrap_or_default(),
                     rule.description.as_deref().unwrap_or("no description")
                 );
 
@@ -134,7 +139,8 @@ impl RuleEngine {
     fn build_plugin_context(&self, header: &MavHeader, msg: &MavMessage) -> PluginContext {
         let message_type = get_message_name(msg);
 
-        // Serialize the full message to JSON
+        // Serialize the full message to JSON (keeps nested structure)
+        // MavMessage serializes as {MESSAGE_TYPE: {fields...}}
         let message_json = serde_json::to_value(msg)
             .unwrap_or_else(|_| serde_json::json!({}));
 
@@ -168,22 +174,7 @@ impl RuleEngine {
             }
         };
 
-        // For COMMAND_LONG, check command name if specified
-        if rule.message_type == "COMMAND_LONG" && rule.command.is_some() {
-            if let Some(cmd_obj) = msg_json.get("COMMAND_LONG") {
-                if let Some(cmd_field) = cmd_obj.get("command") {
-                    let cmd_str = format!("{:?}", cmd_field);
-                    if let Some(ref expected_cmd) = rule.command {
-                        if !cmd_str.contains(expected_cmd) {
-                            debug!("Command mismatch: expected {}, got {}", expected_cmd, cmd_str);
-                            return false;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Check conditions
+        // Check conditions (command field can be checked via conditions.custom like any other field)
         if !self.matches_conditions(header, &msg_json, &msg_name, &rule.conditions) {
             return false;
         }
@@ -223,54 +214,13 @@ impl RuleEngine {
             }
         };
 
-        // Check COMMAND_LONG param conditions (explicit fields)
-        if msg_type == "COMMAND_LONG" {
-            if !self.check_param_condition(msg_data, "param1", conditions.param1) {
-                return false;
-            }
-            if !self.check_param_condition(msg_data, "param2", conditions.param2) {
-                return false;
-            }
-            if !self.check_param_condition(msg_data, "param3", conditions.param3) {
-                return false;
-            }
-            if !self.check_param_condition(msg_data, "param4", conditions.param4) {
-                return false;
-            }
-            if !self.check_param_condition(msg_data, "param5", conditions.param5) {
-                return false;
-            }
-            if !self.check_param_condition(msg_data, "param6", conditions.param6) {
-                return false;
-            }
-            if !self.check_param_condition(msg_data, "param7", conditions.param7) {
-                return false;
-            }
-        }
-
-        // Check any other field conditions (works for ALL message types)
+        // Check all field conditions generically (works for ALL message types)
         for (field_name, expected_value) in &conditions.custom {
             if !self.check_field_condition(msg_data, field_name, expected_value) {
                 return false;
             }
         }
 
-        true
-    }
-
-    /// Check a single parameter condition
-    fn check_param_condition(&self, msg_data: &JsonValue, field: &str, expected: Option<f32>) -> bool {
-        if let Some(expected_val) = expected {
-            if let Some(actual) = msg_data.get(field).and_then(|v| v.as_f64()) {
-                if (actual as f32 - expected_val).abs() > f32::EPSILON {
-                    debug!("{} mismatch: expected {}, got {}", field, expected_val, actual);
-                    return false;
-                }
-            } else {
-                debug!("{} field not found or not a number", field);
-                return false;
-            }
-        }
         true
     }
 
@@ -324,19 +274,9 @@ impl RuleEngine {
 
     /// Execute the action sequence specified by a rule
     fn execute_action(&self, rule: &CommandRule, msg: &MavMessage, header: &MavHeader) -> ProcessResult {
-        // Build ACK info if auto_ack is enabled and this is a COMMAND_LONG
+        // Build ACK info if auto_ack is enabled (works for ANY message type)
         let ack_info = if rule.auto_ack {
-            match msg {
-                MavMessage::COMMAND_LONG(cmd) => Some(AckInfo {
-                    command: cmd.command,
-                    target_system: cmd.target_system,
-                    target_component: cmd.target_component,
-                }),
-                _ => {
-                    warn!("auto_ack enabled but message is not COMMAND_LONG, ignoring");
-                    None
-                }
-            }
+            self.build_ack_info(rule, msg, header)
         } else {
             None
         };
@@ -356,11 +296,13 @@ impl RuleEngine {
                     let timeout = Duration::from_secs(rule.batch_timeout_seconds.unwrap_or(30));
                     let key = rule.batch_key.clone();
                     let forward_on_timeout = rule.batch_timeout_forward;
+                    let system_id_field = rule.batch_system_id_field.clone();
                     Action::Batch {
                         count,
                         timeout,
                         key,
                         forward_on_timeout,
+                        system_id_field,
                     }
                 }
                 "block" => Action::Block,
@@ -394,6 +336,70 @@ impl RuleEngine {
         }
 
         ProcessResult { actions, ack_info }
+    }
+
+    /// Build ACK info generically from any message type
+    fn build_ack_info(&self, rule: &CommandRule, msg: &MavMessage, _header: &MavHeader) -> Option<AckInfo> {
+        // Validate that all required fields are present
+        let message_type = rule.ack_message_type.as_ref()?;
+        let source_system_field = rule.ack_source_system_field.as_ref()?;
+        let source_component_field = rule.ack_source_component_field.as_ref()?;
+
+        // Serialize message to JSON to extract fields
+        let full_json = match serde_json::to_value(msg) {
+            Ok(val) => val,
+            Err(e) => {
+                warn!("Failed to serialize message for ACK building: {}", e);
+                return None;
+            }
+        };
+
+        // Extract the inner message data (unwrap from enum variant)
+        let msg_type = get_message_name(msg);
+        let msg_data = match full_json.get(&msg_type) {
+            Some(data) => data,
+            None => {
+                warn!("Message data not found for ACK building (expected {}, got {:?})", msg_type, full_json);
+                return None;
+            }
+        };
+
+        // Extract source system_id from specified field
+        let source_system = match msg_data.get(source_system_field) {
+            Some(val) => match val.as_u64() {
+                Some(v) => v as u8,
+                None => {
+                    warn!("Field '{}' is not a valid system_id", source_system_field);
+                    return None;
+                }
+            },
+            None => {
+                warn!("Field '{}' not found in message for source_system", source_system_field);
+                return None;
+            }
+        };
+
+        // Extract source component_id from specified field
+        let source_component = match msg_data.get(source_component_field) {
+            Some(val) => match val.as_u64() {
+                Some(v) => v as u8,
+                None => {
+                    warn!("Field '{}' is not a valid component_id", source_component_field);
+                    return None;
+                }
+            },
+            None => {
+                warn!("Field '{}' not found in message for source_component", source_component_field);
+                return None;
+            }
+        };
+
+        Some(AckInfo {
+            message_type: message_type.clone(),
+            source_system,
+            source_component,
+            fields: rule.ack_fields.clone(),
+        })
     }
 }
 

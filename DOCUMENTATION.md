@@ -42,13 +42,13 @@ Both directions support all actions: forward, block, modify, delay, and batch.
 - **MAVLink message parsing** (supports both v1 and v2)
 - **Rule-based filtering system** with conditions, priorities, and direction control
 - **Flexible actions**: delay, block, forward, modify, batch
-- **Per-command rule configuration** via TOML file
-- **Conditional matching** on any message field
+- **Generic message support** - Works with ALL 300+ MAVLink message types
+- **Conditional matching** on ANY message field
 - **Priority-based rule processing** for complex logic
 - **Direction control**: Apply rules to GCS→Router, Router→GCS, or both
-- **Lua scripting** for modifiers and plugins (works with ALL MAVLink message types)
-- **Batch synchronization** across multiple drones
-- **Auto-ACK** for command acknowledgment
+- **Lua scripting** for modifiers and plugins (unified API)
+- **Batch synchronization** across multiple drones with configurable field extraction
+- **Generic Auto-ACK** for ANY message type (not just COMMAND_LONG)
 - **Async/non-blocking operation** using Tokio
 - **Detailed logging** with tracing
 
@@ -139,19 +139,25 @@ Rules are the core of BITCH, allowing you to intercept, modify, delay, or block 
 
 ```toml
 [[rules]]
-message_type = "MESSAGE_TYPE"    # Which message type to match
-command = "COMMAND_NAME"         # [COMMAND_LONG only] Specific command
+message_type = "MESSAGE_TYPE"    # Which message type to match (required)
 priority = 10                    # Higher = checked first (default: 0)
-actions = ["action1", "action2"] # Sequential actions to apply
-direction = "gcs_to_router"      # Flow direction (see below)
+actions = ["action1", "action2"] # Sequential actions to apply (required)
+direction = "gcs_to_router"      # Flow direction (default: "gcs_to_router")
 description = "What this rule does"
 
-[rules.conditions]               # Match specific message fields
-param1 = 1.0                     # [COMMAND_LONG] Match param values
+[rules.conditions]               # Match specific message fields (optional)
+command = "MAV_CMD_..."          # Match command field (for messages with command enum)
+param1 = 1.0                     # Match param1 (for COMMAND_LONG)
 system_id = 1                    # Match header system ID
-fix_type = 3                     # [GPS_RAW_INT] Match fix type
-# ... any field in the message type
+fix_type = 3                     # Match fix_type (for GPS_RAW_INT)
+# ... any field in ANY message type
 ```
+
+**Key Changes from Previous Versions:**
+- ❌ No more `command` field at rule level (was COMMAND_LONG-specific)
+- ✅ Use `conditions.command` instead (works for ALL messages with command field)
+- ❌ No more explicit `param1-7` fields in struct
+- ✅ All fields go in `conditions` as generic key-value pairs
 
 ### Direction Control
 
@@ -200,18 +206,78 @@ Synchronize messages across multiple drones.
 
 ```toml
 actions = ["batch", "delay"]
-batch_count = 3                    # Wait for 3 unique drones
-batch_timeout_seconds = 60         # Timeout after 60s
-batch_timeout_forward = true       # Forward on timeout
-batch_key = "arm_swarm"           # Batch group identifier
+batch_count = 3                     # Wait for 3 unique drones
+batch_timeout_seconds = 60          # Timeout after 60s
+batch_timeout_forward = true        # Forward on timeout (or drop if false)
+batch_key = "arm_swarm"            # Batch group identifier
+batch_system_id_field = "target_system"  # NEW: Extract system_id from this field
 ```
 
-### Auto-ACK Feature
+**Batch System ID Extraction (NEW):**
+- `batch_system_id_field` - Optional field name to extract system_id from message
+- If not specified, uses `header.system_id` (sender)
+- If specified, extracts from message field (e.g., `"target_system"` for COMMAND_LONG)
+- Works for ANY message type!
 
-For COMMAND_LONG messages, automatically send COMMAND_ACK to GCS:
+**Example - Batch by target (recipient):**
+```toml
+batch_system_id_field = "target_system"  # Batch by who receives the command
+```
+
+**Example - Batch by sender (default):**
+```toml
+# No batch_system_id_field = uses header.system_id (who sent the message)
+```
+
+### Auto-ACK Feature (COMPLETELY GENERIC)
+
+Automatically send ACK responses for ANY message type (not just COMMAND_LONG):
 
 ```toml
-auto_ack = true  # GCS won't wait for delayed command
+auto_ack = true
+ack_message_type = "COMMAND_ACK"              # Which message type to send as ACK
+ack_source_system_field = "target_system"     # Field to use as ACK source system_id
+ack_source_component_field = "target_component"  # Field to use as ACK source component_id
+
+[rules.ack_fields]
+result = "MAV_RESULT_ACCEPTED"   # Fields to set in ACK message
+# ... any fields for the ACK message type
+```
+
+**How it works:**
+1. When rule matches, extracts `source_system` and `source_component` from the matched message
+2. Builds an ACK message of type `ack_message_type` with fields from `ack_fields`
+3. Sends ACK immediately (before delays/batches) so GCS doesn't timeout
+4. ACK appears to come FROM the target system (not the proxy)
+
+**Example - COMMAND_ACK for COMMAND_LONG:**
+```toml
+[[rules]]
+message_type = "COMMAND_LONG"
+auto_ack = true
+ack_message_type = "COMMAND_ACK"
+ack_source_system_field = "target_system"
+ack_source_component_field = "target_component"
+
+[rules.conditions]
+command = "MAV_CMD_COMPONENT_ARM_DISARM"
+
+[rules.ack_fields]
+result = "MAV_RESULT_ACCEPTED"
+```
+
+**Example - MISSION_ACK for MISSION_REQUEST_LIST:**
+```toml
+[[rules]]
+message_type = "MISSION_REQUEST_LIST"
+auto_ack = true
+ack_message_type = "MISSION_COUNT"
+ack_source_system_field = "target_system"
+ack_source_component_field = "target_component"
+
+[rules.ack_fields]
+count = 0
+mission_type = "MAV_MISSION_TYPE_MISSION"
 ```
 
 ### Message Types
@@ -220,6 +286,7 @@ BITCH supports ALL 300+ MAVLink message types through generic handling:
 
 **Common types:**
 - `COMMAND_LONG` - Command messages
+- `COMMAND_INT` - Command messages (integer coordinates)
 - `HEARTBEAT` - Heartbeat messages
 - `GPS_RAW_INT` - GPS data
 - `GLOBAL_POSITION_INT` - Global position
@@ -227,12 +294,18 @@ BITCH supports ALL 300+ MAVLink message types through generic handling:
 - `RC_CHANNELS` - RC input
 - `MISSION_ITEM` - Mission waypoints
 - `MISSION_ITEM_INT` - Mission waypoints (integer)
+- `MISSION_REQUEST_LIST` - Request mission list
+- `MISSION_ACK` - Mission acknowledgment
 - `STATUSTEXT` - Status text messages
 - `SYS_STATUS` - System status
 - `BATTERY_STATUS` - Battery info
+- `PARAM_REQUEST_READ` - Parameter read request
+- `PARAM_VALUE` - Parameter value
 - And 290+ more...
 
-### Common Commands (for COMMAND_LONG)
+### Common Commands (for messages with command field)
+
+**COMMAND_LONG / COMMAND_INT commands:**
 
 | ID  | Command | Description |
 |-----|---------|-------------|
@@ -245,602 +318,728 @@ BITCH supports ALL 300+ MAVLink message types through generic handling:
 | 183 | MAV_CMD_DO_SET_SERVO | Set servo position |
 | 181 | MAV_CMD_DO_SET_RELAY | Set relay state |
 
+**MISSION_ITEM / MISSION_ITEM_INT commands:**
+
+| ID  | Command | Description |
+|-----|---------|-------------|
+| 16  | MAV_CMD_NAV_WAYPOINT | Waypoint |
+| 22  | MAV_CMD_NAV_TAKEOFF | Takeoff waypoint |
+| 21  | MAV_CMD_NAV_LAND | Land waypoint |
+| 19  | MAV_CMD_NAV_LOITER_UNLIM | Loiter unlimited |
+| 177 | MAV_CMD_DO_JUMP | Jump to waypoint |
+
 ### Conditions
 
-Match on any field in the message data:
+Conditions allow matching on specific fields within messages. ALL fields work the same way - no special cases!
 
-**For COMMAND_LONG:**
+#### Header Conditions (work for ALL message types)
+
 ```toml
 [rules.conditions]
-param1 = 1.0              # Match param1 value
-param2 = 0.0              # Match param2 value
-system_id = 1             # Match system ID
-component_id = 1          # Match component ID
+system_id = 1        # Match messages from system ID 1
+component_id = 1     # Match messages from component ID 1
 ```
 
-**For other messages:**
+#### Message Field Conditions (COMPLETELY GENERIC)
+
+Match ANY field in ANY message type:
+
 ```toml
 [rules.conditions]
-fix_type = 3              # [GPS_RAW_INT] Match GPS fix type
-lat = 473566094           # [GLOBAL_POSITION_INT] Match latitude
-base_mode = 89            # [HEARTBEAT] Match base mode
+# COMMAND_LONG fields
+command = "MAV_CMD_COMPONENT_ARM_DISARM"
+param1 = 1.0
+param2 = 0.0
+target_system = 1
+target_component = 1
+
+# GPS_RAW_INT fields
+fix_type = 3
+satellites_visible = 10
+
+# HEARTBEAT fields
+system_status = "MAV_STATE_ACTIVE"
+autopilot = "MAV_AUTOPILOT_ARDUPILOTMEGA"
+
+# GLOBAL_POSITION_INT fields
+alt = 1000
+
+# RC_CHANNELS fields
+chan1_raw = 1500
+
+# ANY field in ANY message type - completely generic!
 ```
 
-Use MAVLink documentation to find field names for each message type.
-
-### Priority System
-
-Rules are evaluated in priority order (highest first):
-
-```toml
-[[rules]]
-priority = 100  # Checked first
-# ...
-
-[[rules]]
-priority = 50   # Checked second
-# ...
-
-[[rules]]
-priority = 0    # Checked last (default)
-# ...
-```
-
-Use priorities to create exception rules that override general rules.
-
-### Plugin Execution
-
-Execute Lua plugins when rule matches:
-
-```toml
-plugins = ["arm_notifier", "webhook_example"]
-```
-
-Plugins run before the action is applied.
+**Field matching supports:**
+- **Integers**: Exact match
+- **Floats**: Within epsilon
+- **Strings**: Contains match OR exact match
+- **Booleans**: Exact match
+- **Enums**: String contains match (e.g., `"MAV_CMD_..."`)
 
 ---
 
 ## Modifier System
 
-Modifiers are Lua scripts that transform MAVLink messages. They work with ALL 300+ MAVLink message types through automatic serialization.
+Modifiers are Lua scripts that transform MAVLink messages before forwarding. They work with ALL 300+ message types!
 
 ### Modifier Structure
 
+Modifiers must implement a `modify()` function:
+
 ```lua
 function modify(ctx)
-    -- Access the message
     local msg = ctx.message
-    
-    -- ctx.message_type tells you what kind of message it is
-    if ctx.message_type == "COMMAND_LONG" then
-        -- Access fields directly from msg
-        log.info(string.format("COMMAND_LONG: command=%s, target_system=%d",
-            tostring(msg.command), msg.target_system))
-        
+
+    -- Messages are serialized as {MESSAGE_TYPE = {fields...}}
+    if msg.COMMAND_LONG then
+        local cmd = msg.COMMAND_LONG
         -- Modify fields
-        msg.param1 = msg.param1 * 1.5
+        cmd.param1 = cmd.param1 * 2
+        msg.COMMAND_LONG = cmd
+        ctx.message = msg
     end
-    
-    if ctx.message_type == "HEARTBEAT" then
-        -- Note: base_mode is a table with 'bits' field
-        if msg.base_mode and msg.base_mode.bits then
-            msg.base_mode.bits = msg.base_mode.bits | 128  -- Set armed bit
-        end
-    end
-    
-    if ctx.message_type == "GLOBAL_POSITION_INT" then
-        -- Modify position data
-        msg.alt = math.min(msg.alt, 100000)  -- Clamp altitude
-    end
-    
-    -- Update the message
-    ctx.message = msg
+
     return ctx
 end
 ```
 
-### Context Fields
-
-- `ctx.system_id` - MAVLink header system ID
-- `ctx.component_id` - MAVLink header component ID
-- `ctx.message_type` - Message type name (e.g., "COMMAND_LONG")
-- `ctx.message` - Message data as a Lua table with fields directly accessible
-
-### Message Field Access
-
-Message fields are accessed directly from `ctx.message`:
+### Context Structure
 
 ```lua
--- Correct:
-local target = msg.target_system
-local param1 = msg.param1
-
--- Wrong (old nested structure):
--- local target = msg.COMMAND_LONG.target_system
+ctx = {
+    system_id = 1,              -- Header system ID
+    component_id = 1,           -- Header component ID
+    sequence = 123,             -- Header sequence number
+    message_type = "COMMAND_LONG",  -- Message type name
+    message = {                 -- Message data (nested structure)
+        COMMAND_LONG = {        -- Or HEARTBEAT, GPS_RAW_INT, etc.
+            command = ...,
+            param1 = ...,
+            target_system = ...,
+            -- ... all fields
+        }
+    }
+}
 ```
 
-### Special Fields
+### Available APIs
 
-Some fields are tables, not simple values:
-
-**base_mode (HEARTBEAT):**
 ```lua
-if msg.base_mode and msg.base_mode.bits then
-    local mode = msg.base_mode.bits
-    msg.base_mode.bits = mode | 128  -- Set armed bit
+log.info(message)
+log.warn(message)
+log.error(message)
+log.debug(message)
+```
+
+### Examples
+
+#### Example 1: Modify COMMAND_LONG parameters
+
+```lua
+function modify(ctx)
+    local msg = ctx.message
+
+    if msg.COMMAND_LONG then
+        local cmd = msg.COMMAND_LONG
+
+        -- Double param1 value
+        cmd.param1 = cmd.param1 * 2
+
+        log.info(string.format("Modified param1 for cmd %s", tostring(cmd.command)))
+
+        msg.COMMAND_LONG = cmd
+        ctx.message = msg
+    end
+
+    return ctx
 end
 ```
 
-### Logging in Modifiers
+#### Example 2: Modify HEARTBEAT to show always armed
 
 ```lua
-log.info("Information message")
-log.warn("Warning message")
-log.error("Error message")
-log.debug("Debug message")
+function modify(ctx)
+    local msg = ctx.message
+
+    if msg.HEARTBEAT then
+        local hb = msg.HEARTBEAT
+
+        -- base_mode is a table with 'bits' field for bitflags
+        if hb.base_mode and hb.base_mode.bits then
+            local armed_bit = 128  -- MAV_MODE_FLAG_SAFETY_ARMED
+            hb.base_mode.bits = hb.base_mode.bits | armed_bit
+
+            msg.HEARTBEAT = hb
+            ctx.message = msg
+        end
+    end
+
+    return ctx
+end
 ```
 
-### Loading Modifiers
+#### Example 3: Clamp altitude in GLOBAL_POSITION_INT
 
-1. Create `.lua` file in `modifiers/` directory
-2. Add to `config.toml`:
-```toml
-[modifiers.load]
-my_modifier = "my_modifier.lua"
+```lua
+function modify(ctx)
+    local msg = ctx.message
+
+    if msg.GLOBAL_POSITION_INT then
+        local pos = msg.GLOBAL_POSITION_INT
+
+        -- Limit altitude to 100m
+        if pos.alt > 100000 then  -- Altitude in millimeters
+            pos.alt = 100000
+            log.warn("Clamped altitude to 100m")
+        end
+
+        msg.GLOBAL_POSITION_INT = pos
+        ctx.message = msg
+    end
+
+    return ctx
+end
 ```
-3. Reference in rules:
-```toml
-[[rules]]
-actions = ["modify", "forward"]
-modifier = "my_modifier"
+
+#### Example 4: Modify MISSION_ITEM_INT waypoint
+
+```lua
+function modify(ctx)
+    local msg = ctx.message
+
+    if msg.MISSION_ITEM_INT then
+        local item = msg.MISSION_ITEM_INT
+
+        -- Reduce all waypoint altitudes by 20%
+        item.z = item.z * 0.8
+
+        log.info(string.format("Modified waypoint #%d altitude", item.seq))
+
+        msg.MISSION_ITEM_INT = item
+        ctx.message = msg
+    end
+
+    return ctx
+end
 ```
 
-### Example Modifiers
+### Enum/Bitflag Handling
 
-See `modifiers/always_armed.lua` and `modifiers/generic_modifier.lua` for complete examples.
+Some fields are enums or bitflags and serialize as tables:
+
+```lua
+-- Bitflags (base_mode, custom_mode, etc.)
+if hb.base_mode.bits then
+    local mode = hb.base_mode.bits
+    hb.base_mode.bits = mode | 128  -- Set bit
+end
+
+-- Enums (typically accessed as values)
+local cmd = msg.COMMAND_LONG.command  -- Already the enum value
+```
 
 ---
 
 ## Plugin System
 
-Plugins are Lua scripts that execute when rules match, performing side effects like notifications or logging.
+Plugins are Lua scripts that execute side effects when rules match. They have the same API as modifiers but DON'T return modified messages.
 
 ### Plugin Structure
 
+Plugins must implement an `on_match()` function:
+
 ```lua
 function on_match(ctx)
-    -- Your plugin logic here
-    log.info(string.format("Plugin executed for system %d", ctx.system_id))
-    
-    -- Access message data
     local msg = ctx.message
-    
-    if ctx.message_type == "COMMAND_LONG" then
-        local target = msg.target_system
-        local param1 = msg.param1
-        
-        -- Perform actions based on command
-        if msg.command == "MAV_CMD_COMPONENT_ARM_DISARM" and param1 == 1.0 then
-            log.info("ARM command detected")
-            -- Send notification, log to file, etc.
+
+    -- Messages are serialized as {MESSAGE_TYPE = {fields...}}
+    if msg.COMMAND_LONG then
+        local cmd = msg.COMMAND_LONG
+
+        -- Do something (send notification, log, etc.)
+        log.info(string.format("ARM command for system %d", cmd.target_system))
+    end
+end
+```
+
+### Context Structure
+
+**Identical to modifiers:**
+
+```lua
+ctx = {
+    system_id = 1,              -- Header system ID
+    component_id = 1,           -- Header component ID
+    message_type = "COMMAND_LONG",  -- Message type name
+    message = {                 -- Message data (nested structure)
+        COMMAND_LONG = {        -- Or HEARTBEAT, GPS_RAW_INT, etc.
+            command = ...,
+            param1 = ...,
+            target_system = ...,
+            -- ... all fields
+        }
+    }
+}
+```
+
+### Available APIs
+
+**Logging:**
+```lua
+log.info(message)
+log.warn(message)
+log.error(message)
+log.debug(message)
+```
+
+**Serial Communication:**
+```lua
+success = serial.write(port, baudrate, data, timeout_ms)
+success = serial.write_line(port, baudrate, data, timeout_ms)
+```
+
+**HTTP Requests:**
+```lua
+response = http.get(url, headers_table)
+response = http.post(url, body, headers_table)
+```
+
+**Utilities:**
+```lua
+util.sleep(milliseconds)
+success = util.file_write(path, content)
+content = util.file_read(path)
+```
+
+### Examples
+
+#### Example 1: Send serial notification on ARM
+
+```lua
+function on_match(ctx)
+    local msg = ctx.message
+
+    if msg.COMMAND_LONG then
+        local cmd = msg.COMMAND_LONG
+
+        -- Calculate drone ID
+        local drone_id = (cmd.target_system - 100) % 10
+        local message = string.format("d%02dd", drone_id)
+
+        -- Send to serial device
+        local success = serial.write("/dev/ttyUSB0", 57600, message, 3000)
+
+        if success then
+            log.info("Serial notification sent")
+        else
+            log.error("Failed to send serial notification")
         end
     end
 end
 ```
 
-### Context Fields
-
-- `ctx.system_id` - MAVLink header system ID
-- `ctx.component_id` - MAVLink header component ID
-- `ctx.message_type` - Message type name
-- `ctx.message` - Full message data as a table
-
-### Message Field Access
-
-Same as modifiers - fields are accessed directly:
+#### Example 2: Send webhook on ARM command
 
 ```lua
-local msg = ctx.message
-local target = msg.target_system  -- Correct
--- NOT: msg.COMMAND_LONG.target_system (old API)
+function on_match(ctx)
+    local msg = ctx.message
+
+    if msg.COMMAND_LONG then
+        local cmd = msg.COMMAND_LONG
+
+        -- Build JSON payload
+        local payload = string.format([[{
+            "event": "arm_command",
+            "system_id": %d,
+            "target_system": %d,
+            "command": "%s",
+            "timestamp": %d
+        }]], ctx.system_id, cmd.target_system,
+            tostring(cmd.command), os.time())
+
+        -- Send webhook
+        local response = http.post("https://example.com/webhook", payload)
+
+        if response then
+            log.info("Webhook sent successfully")
+        else
+            log.warn("Webhook failed")
+        end
+    end
+end
 ```
 
-### Available APIs
+#### Example 3: Log GPS fix status
 
-#### Logging
 ```lua
-log.info("Information message")
-log.warn("Warning message")
-log.error("Error message")
-log.debug("Debug message")
+function on_match(ctx)
+    local msg = ctx.message
+
+    if msg.GPS_RAW_INT then
+        local gps = msg.GPS_RAW_INT
+
+        log.info(string.format("GPS Fix: type=%d, sats=%d, lat=%d, lon=%d",
+            gps.fix_type, gps.satellites_visible, gps.lat, gps.lon))
+    end
+end
 ```
-
-#### Serial Communication
-```lua
--- Write raw data to serial port
-serial.write(port, baudrate, data, timeout_ms)
-
--- Example:
-serial.write("/dev/ttyUSB0", 57600, "d01d", 3000)
-
--- Write with automatic newline
-serial.write_line("/dev/ttyUSB0", 57600, "command", 3000)
-```
-
-#### HTTP Requests
-```lua
--- GET request
-local response = http.get("https://api.example.com/data")
-local response = http.get("https://api.example.com/data", {["Authorization"] = "Bearer token"})
-
--- POST request
-local body = '{"key": "value"}'
-local response = http.post("https://api.example.com/webhook", body)
-local response = http.post("https://api.example.com/webhook", body, {["Content-Type"] = "application/json"})
-```
-
-#### Utility Functions
-```lua
--- Sleep for milliseconds
-util.sleep(1000)
-
--- File operations
-util.file_write("/tmp/log.txt", "content")
-local content = util.file_read("/tmp/log.txt")
-```
-
-### Loading Plugins
-
-1. Create `.lua` file in `plugins/` directory
-2. Add to `config.toml`:
-```toml
-[plugins.load]
-my_plugin = "my_plugin.lua"
-```
-3. Reference in rules:
-```toml
-[[rules]]
-plugins = ["my_plugin"]
-```
-
-### Example Plugins
-
-See `plugins/arm_notifier.lua` and `plugins/webhook_example.lua` for complete examples.
 
 ---
 
 ## Advanced Examples
 
-### Bidirectional ARM Command Handling
+### Example 1: Synchronize ARM Across Swarm
+
+Batch ARM commands from multiple drones, delay, then forward:
 
 ```toml
-# Synchronize ARM commands from GCS across multiple drones
 [[rules]]
 message_type = "COMMAND_LONG"
-command = "MAV_CMD_COMPONENT_ARM_DISARM"
 actions = ["batch", "delay"]
-batch_count = 2
-batch_timeout_seconds = 60
+batch_count = 3                          # Wait for 3 drones
+batch_timeout_seconds = 30
+batch_timeout_forward = true
 batch_key = "arm_swarm"
+batch_system_id_field = "target_system"  # Batch by target (recipient)
 delay_seconds = 5
 auto_ack = true
+ack_message_type = "COMMAND_ACK"
+ack_source_system_field = "target_system"
+ack_source_component_field = "target_component"
 plugins = ["arm_notifier"]
 direction = "gcs_to_router"
-description = "Sync ARM across 2 drones, delay 5s"
+description = "Synchronize ARM across 3 drones with 5s delay"
 
 [rules.conditions]
-param1 = 1.0  # Only ARM (DISARM passes through)
+command = "MAV_CMD_COMPONENT_ARM_DISARM"
+param1 = 1.0  # Only ARM (not DISARM)
+
+[rules.ack_fields]
+result = "MAV_RESULT_ACCEPTED"
 ```
 
-### Modify HEARTBEAT in Both Directions
+### Example 2: Block Emergency LAND Commands
+
+Prevent emergency land from specific system:
 
 ```toml
-# Make drones appear armed to GCS
+[[rules]]
+message_type = "COMMAND_LONG"
+actions = ["block"]
+priority = 100  # High priority
+direction = "gcs_to_router"
+description = "Block emergency LAND from system 255"
+
+[rules.conditions]
+command = "MAV_CMD_NAV_LAND"
+param1 = 1.0  # Emergency flag
+system_id = 255  # GCS
+```
+
+### Example 3: Modify HEARTBEAT from Drones
+
+Make all drones appear armed:
+
+```toml
 [[rules]]
 message_type = "HEARTBEAT"
 actions = ["modify", "forward"]
 modifier = "always_armed"
 direction = "router_to_gcs"
 description = "Show drones as always armed"
-
-# Block GCS heartbeats to router
-[[rules]]
-message_type = "HEARTBEAT"
-actions = ["block"]
-direction = "gcs_to_router"
-description = "Block GCS heartbeats"
-
-[rules.conditions]
-system_id = 255
 ```
 
-### Priority-Based Exception Rules
+### Example 4: Delay GPS Data with 3D Fix
 
-```toml
-# HIGH PRIORITY: Emergency landing passes immediately
-[[rules]]
-message_type = "COMMAND_LONG"
-command = "MAV_CMD_NAV_LAND"
-actions = ["forward"]
-priority = 1000
-description = "Emergency landing - immediate"
-
-[rules.conditions]
-param1 = 1.0  # Emergency flag
-
-# LOW PRIORITY: Normal landing delayed
-[[rules]]
-message_type = "COMMAND_LONG"
-command = "MAV_CMD_NAV_LAND"
-actions = ["delay"]
-delay_seconds = 3
-priority = 10
-description = "Normal landing - 3s delay"
-```
-
-### Block Specific System in Both Directions
-
-```toml
-[[rules]]
-message_type = "COMMAND_LONG"
-command = "MAV_CMD_NAV_TAKEOFF"
-actions = ["block"]
-direction = "both"
-description = "Prevent system 1 from taking off"
-
-[rules.conditions]
-system_id = 1
-```
-
-### Modify GPS Data from Drones
+Add 1 second delay to GPS messages:
 
 ```toml
 [[rules]]
 message_type = "GPS_RAW_INT"
-actions = ["modify", "forward"]
-modifier = "gps_modifier"
+actions = ["delay"]
+delay_seconds = 1
 direction = "router_to_gcs"
-description = "Modify GPS data before sending to GCS"
+description = "Delay GPS with 3D fix"
 
 [rules.conditions]
-fix_type = 3  # Only 3D fix
+fix_type = 3  # GPS_FIX_TYPE_3D_FIX
 ```
 
-### Batch Mission Items
+### Example 5: Block Error Messages
+
+Filter out error STATUSTEXT messages:
+
+```toml
+[[rules]]
+message_type = "STATUSTEXT"
+actions = ["block"]
+direction = "router_to_gcs"
+description = "Block error status messages"
+
+[rules.conditions]
+text = "error"  # Contains "error"
+```
+
+### Example 6: Batch Mission Items Across Fleet
+
+Synchronize mission uploads:
 
 ```toml
 [[rules]]
 message_type = "MISSION_ITEM_INT"
 actions = ["batch"]
-batch_count = 5
+batch_count = 5                          # Wait for 5 drones
 batch_timeout_seconds = 10
 batch_key = "mission_sync"
+batch_system_id_field = "target_system"
 direction = "gcs_to_router"
-description = "Sync mission items across 5 drones"
+description = "Sync mission items across fleet"
 ```
 
-### Chain Multiple Actions
+### Example 7: Auto-ACK Mission Requests
+
+Immediately acknowledge mission list requests:
 
 ```toml
 [[rules]]
-message_type = "COMMAND_LONG"
-command = "MAV_CMD_COMPONENT_ARM_DISARM"
-actions = ["modify", "batch", "delay", "forward"]
-modifier = "arm_modifier"
-batch_count = 3
-batch_key = "arm_swarm"
-delay_seconds = 5
-plugins = ["arm_notifier", "webhook_example"]
+message_type = "MISSION_REQUEST_LIST"
+actions = ["delay"]
+delay_seconds = 2
 auto_ack = true
+ack_message_type = "MISSION_COUNT"
+ack_source_system_field = "target_system"
+ack_source_component_field = "target_component"
 direction = "gcs_to_router"
-description = "Full pipeline: modify -> batch -> delay -> forward"
+description = "ACK mission requests"
 
-[rules.conditions]
-param1 = 1.0
+[rules.ack_fields]
+count = 0
+mission_type = "MAV_MISSION_TYPE_MISSION"
 ```
 
 ---
 
 ## Technical Details
 
-### How It Works
-
-1. **Config Loading**: Loads and validates `config.toml`, sorts rules by priority
-2. **GCS Connection**: Listens on port 14550 for incoming GCS connections
-3. **Router Connection**: Maintains connection to mavlink-router on port 14551
-4. **Message Processing**:
-   - **GCS → Router**: Parses MAVLink, applies rules with direction "gcs_to_router" or "both"
-   - **Router → GCS**: Parses MAVLink, applies rules with direction "router_to_gcs" or "both"
-5. **Rule Matching**: Checks conditions in priority order, first match wins
-6. **Action Execution**: Forwards, delays (async), blocks, modifies, or batches messages
-7. **Destination Handling**: Uses unified `Destination` enum for both Router and GCS
-
-### Concurrency Model
-
-- Each delayed message spawns an independent async task
-- Delays are truly concurrent - multiple commands can be delayed simultaneously
-- Non-delayed traffic flows without blocking
-- Batch manager handles synchronization across multiple drones with timeouts
-
-### Safety Features
-
-- Invalid MAVLink messages are forwarded anyway (fail-open)
-- Config validation prevents invalid rules at startup
-- Both directions support full rule processing
-- Automatic error handling and logging
-
-### Code Structure
+### Message Flow
 
 ```
-src/
-├── main.rs       # Entry point and initialization
-├── config.rs     # Configuration loading and validation
-├── rules.rs      # Rule engine and message processing
-├── proxy.rs      # UDP proxy and forwarding logic
-├── batch.rs      # Batch synchronization manager
-├── modifiers.rs  # Lua modifier management
-└── plugins/
-    └── api/      # Plugin API implementation
+1. UDP Packet Received
+2. Parse MAVLink (v2/v1)
+3. Extract message type
+4. Find matching rule (priority order)
+   - Check direction
+   - Check message_type
+   - Check conditions (ALL fields generic)
+5. Execute plugins (if any)
+6. Build action sequence
+7. Execute modifiers (if modify action)
+8. Send ACK (if auto_ack)
+9. Execute actions recursively:
+   - Forward → send packet
+   - Block → drop packet
+   - Modify → reconstruct packet
+   - Delay → spawn async task
+   - Batch → queue or release
 ```
 
-### Generic Message Support
+### Rule Processing
 
-BITCH supports ALL MAVLink message types (300+) through:
-- **Automatic serde serialization** to Lua tables
-- **Dynamic message parsing** using mavlink-rs
-- **Generic rule matching** on message_type string
-- **Field-level condition matching** via JSON serialization
+- Rules are sorted by **priority** (highest first) at startup
+- First matching rule wins
+- If no rule matches, message is forwarded immediately
+- Direction filter applied first (efficient)
+- Message type check (exact string match)
+- Conditions checked last (generic field matching via JSON)
 
-No Rust code changes needed to support new message types!
+### Action Execution
+
+Actions execute **sequentially** in the order specified:
+
+```toml
+actions = ["modify", "batch", "delay", "forward"]
+```
+
+1. **modify** - Transform message
+2. **batch** - Queue until threshold met
+3. **delay** - Wait N seconds
+4. **forward** - Send to destination
+
+### Batch Behavior
+
+**Threshold Met:**
+- All queued packets released
+- Remaining actions applied to ALL packets
+- Batch removed from memory
+
+**Timeout:**
+- If `batch_timeout_forward = true`: Forward all packets directly (no remaining actions)
+- If `batch_timeout_forward = false`: Drop all packets
+- Warning logged with statistics
+
+### Auto-ACK Behavior
+
+**When enabled:**
+1. Extract source system/component from matched message using configured fields
+2. Build ACK message of specified type with configured fields
+3. Send ACK **immediately** (before delays/batches)
+4. ACK appears to come FROM target system (not proxy)
+5. GCS receives instant ACK and doesn't wait for delayed command
+
+**ACK Source:**
+```rust
+MavHeader {
+    system_id: extracted_from_message,  // From ack_source_system_field
+    component_id: extracted_from_message,  // From ack_source_component_field
+    sequence: 0,
+}
+```
+
+### Generic Field Extraction
+
+**All systems use the same generic extraction:**
+
+```rust
+// Serialize message to JSON
+let msg_json = serde_json::to_value(msg)?;
+
+// Get message type wrapper
+let msg_data = msg_json.get("MESSAGE_TYPE")?;
+
+// Extract any field
+let field_value = msg_data.get("field_name")?;
+```
+
+**Used for:**
+- Condition matching (ANY field in ANY message)
+- Auto-ACK field extraction (source_system, source_component)
+- Batch system_id extraction (configurable field)
+
+**No special cases for any message type!**
 
 ---
 
 ## Development
 
-### Building
-```bash
-cargo build
-```
+### Adding New Rules
 
-### Running with Debug Output
-Edit `config.toml`:
-```toml
-[logging]
-level = "debug"
-```
+1. Edit `config.toml`
+2. Add `[[rules]]` section
+3. Specify `message_type` and `actions`
+4. Add `[rules.conditions]` if needed
+5. Reload BITCH (it reads config on startup)
 
-Then run:
-```bash
-cargo run
-```
+### Creating Modifiers
 
-### Running Tests
-```bash
-cargo test
-```
+1. Create `modifiers/my_modifier.lua`
+2. Implement `modify(ctx)` function
+3. Add to `config.toml`:
+   ```toml
+   [modifiers.load]
+   my_modifier = "my_modifier.lua"
+   ```
+4. Reference in rule:
+   ```toml
+   modifier = "my_modifier"
+   ```
 
-### Adding New Message Types
+### Creating Plugins
 
-No code changes needed! Just use the message type name in rules:
+1. Create `plugins/my_plugin.lua`
+2. Implement `on_match(ctx)` function
+3. Add to `config.toml`:
+   ```toml
+   [plugins.load]
+   my_plugin = "my_plugin.lua"
+   ```
+4. Reference in rule:
+   ```toml
+   plugins = ["my_plugin"]
+   ```
 
-```toml
-[[rules]]
-message_type = "YOUR_NEW_MESSAGE_TYPE"
-actions = ["forward"]
-```
-
-### Extending the Modifier API
-
-Edit `src/modifiers.rs` to add new Lua APIs accessible to modifiers.
-
-### Extending the Plugin API
-
-Edit `src/plugins/api/mod.rs` to add new APIs for plugins.
-
-### Testing Without Drones
-
-Monitor traffic without actual drones:
+### Testing
 
 ```bash
-# Terminal 1: Run BITCH
-cargo run
+# Run with debug logging
+RUST_LOG=debug cargo run
 
-# Terminal 2: Send test UDP packets
-echo "test" | nc -u localhost 14550
+# Run with trace logging (very verbose)
+RUST_LOG=trace cargo run
+```
+
+### Building for Production
+
+```bash
+cargo build --release
+strip target/release/bitch
 ```
 
 ---
 
 ## Troubleshooting
 
-### GCS Can't Connect
+### Messages Not Being Intercepted
 
-- Ensure BITCH is running and listening on port 14550
-- Check firewall settings: `sudo ufw allow 14550/udp`
-- Verify correct IP address in Mission Planner
-- Check logs for "GCS listening on" message
+- Check `direction` field matches message flow
+- Verify `message_type` is correct (check logs with `RUST_LOG=debug`)
+- Ensure conditions match (check field values in logs)
+- Check rule priority (higher priority rules checked first)
 
-### No Traffic Forwarding
+### Lua Script Errors
 
-- Verify mavlink-router is running: `systemctl status mavlink-router`
-- Check router is on port 14551: `netstat -tulpn | grep 14551`
-- Verify router configuration: `/etc/mavlink-router/main.conf`
-- Increase log level to `debug` to see packet details
+- Check logs for Lua error messages
+- Verify script syntax: `lua -c script.lua`
+- Ensure message structure access is correct (nested under MESSAGE_TYPE)
+- Check that you're returning `ctx` from `modify()` functions
 
-### Rules Not Applying
+### Auto-ACK Not Working
 
-- Check `message_type` matches actual MAVLink message (check logs)
-- Verify `command` name is correct for COMMAND_LONG rules
-- Check conditions match expected values (use `debug` logging)
-- Verify rule `direction` matches message flow
-- Check rule priority order - higher priority rules checked first
-- Validate TOML syntax in config.toml
+- Verify `auto_ack = true`
+- Check `ack_message_type` is correct
+- Verify `ack_source_system_field` and `ack_source_component_field` exist in message
+- Check `[rules.ack_fields]` section is complete
+- Look for "Failed to build ACK" warnings in logs
 
-### Modifier Not Working
+### Batch Not Releasing
 
-- Check modifier is loaded in `[modifiers.load]` section
-- Verify modifier file exists in `modifiers/` directory
-- Check for Lua syntax errors in logs
-- Ensure `modify` function is defined
-- Verify modifier is referenced in rule with `modifier = "name"`
-- Check message field access is correct (direct access, not nested)
-
-### Plugin Errors
-
-- Check plugin is loaded in `[plugins.load]` section
-- Verify plugin file exists in `plugins/` directory
-- Check for Lua errors in logs
-- Ensure `on_match` function is defined
-- Verify message field access: use `msg.field` not `msg.MESSAGE_TYPE.field`
-- Check context fields: use `ctx.system_id` not `ctx.target_system`
-
-### Config Validation Errors
-
-- Ensure all required fields are present
-- Check that `delay` action includes `delay_seconds`
-- Verify `batch` action includes `batch_count` and `batch_timeout_seconds`
-- Verify `modify` action includes `modifier` name
-- Check action names: delay, block, forward, modify, batch
-- Verify direction: gcs_to_router, router_to_gcs, both
+- Check `batch_count` threshold
+- Verify `batch_system_id_field` extracts correct field
+- Check timeout duration
+- Look for "Batch timeout" warnings
+- Ensure unique system IDs are being tracked (not total packet count)
 
 ### Performance Issues
 
-- Reduce log level from `debug` to `info`
-- Check for rules that match too frequently (e.g., HEARTBEAT)
-- Verify delayed messages aren't backing up
-- Monitor CPU usage: `top -p $(pgrep bitch)`
+- Reduce logging level (use `info` or `warn`)
+- Avoid expensive operations in plugins
+- Check for blocking operations (use async APIs)
+- Monitor with `RUST_LOG=info`
 
-### Batch Not Synchronizing
+### Connection Issues
 
-- Verify `batch_count` matches number of expected drones
-- Check `batch_timeout_seconds` is sufficient
-- Ensure `batch_key` is unique for each batch group
-- Check logs for "Created new batch group" messages
-- Verify conditions correctly filter messages for batching
-
----
-
-## Example Output
-
-```
-2025-11-13T09:10:41.804042Z  INFO BITCH MAVLINK Interceptor starting...
-2025-11-13T09:10:41.804055Z  INFO    GCS listening on 0.0.0.0:14550
-2025-11-13T09:10:41.804063Z  INFO    Router at 127.0.0.1:14551
-2025-11-13T09:10:41.804070Z  INFO    Rules loaded: 1
-2025-11-13T09:10:41.804104Z  INFO    - COMMAND_LONG (MAV_CMD_COMPONENT_ARM_DISARM) -> batch -> delay (5s)
-2025-11-13T09:10:41.804182Z  INFO Sockets initialized
-2025-11-13T09:10:41.804441Z  INFO GCS->Router forwarding started
-2025-11-13T09:10:41.804516Z  INFO Router->GCS forwarding started
-2025-11-13T09:10:42.102389Z  INFO GCS connected from: 127.0.0.1:14555
-2025-11-13T09:10:48.102361Z  INFO Rule matched: COMMAND_LONG (MAV_CMD_COMPONENT_ARM_DISARM) - Synchronize ARM commands across 2 drones, then delay 5s before arming
-2025-11-13T09:10:48.102673Z  INFO [Plugin] ARM detected for system 102
-2025-11-13T09:10:48.107362Z  INFO [Plugin] Serial notification sent successfully
-2025-11-13T09:10:48.107519Z  INFO Sent COMMAND_ACK to GCS (sysid=102, cmd=MAV_CMD_SET_MESSAGE_INTERVAL)
-2025-11-13T09:10:48.107584Z  INFO Created new batch group 'arm_swarm' (threshold=2, timeout=60s)
-```
+- Verify mavlink-router is running on port 14551
+- Check firewall rules
+- Ensure no port conflicts
+- Test with `nc -u -l 14550` to verify GCS can connect
 
 ---
 
 ## License
 
-See LICENSE file for details.
+This project is for educational and research purposes.
+
+## Contributing
+
+Contributions welcome! Please ensure:
+- Code follows Rust best practices
+- Tests pass (`cargo test`)
+- Logging is appropriate
+- Documentation is updated
+
+## Support
+
+For issues or questions, check logs with `RUST_LOG=debug` first, then open an issue with:
+- Log output
+- Config file
+- Expected vs actual behavior

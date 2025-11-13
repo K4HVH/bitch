@@ -22,18 +22,17 @@ function format_droneid(target_system, base)
 end
 
 function on_match(ctx)
-    -- For COMMAND_LONG messages, the fields are directly in ctx.message
-    -- (not nested under ctx.message.COMMAND_LONG)
     local msg = ctx.message
 
-    -- Verify this is a COMMAND_LONG message
-    if ctx.message_type ~= "COMMAND_LONG" then
+    -- Messages are serialized as {MESSAGE_TYPE = {fields...}}
+    if not msg.COMMAND_LONG then
         log.error(string.format("Expected COMMAND_LONG message, got message_type: %s", ctx.message_type))
         return
     end
 
-    -- Get target_system directly from message
-    local target_sys = msg.target_system
+    -- Access fields from nested structure
+    local cmd = msg.COMMAND_LONG
+    local target_sys = cmd.target_system
 
     if not target_sys then
         log.error("target_system field not found in COMMAND_LONG message")

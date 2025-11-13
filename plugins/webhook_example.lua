@@ -4,9 +4,11 @@
 function on_match(ctx)
     log.info("Sending webhook notification")
 
-    -- For COMMAND_LONG messages, the fields are directly in ctx.message
     local msg = ctx.message
-    
+
+    -- Messages are serialized as {MESSAGE_TYPE = {fields...}}
+    local cmd = msg.COMMAND_LONG or {}
+
     -- Build JSON payload
     local payload = string.format([[{
         "event": "arm_command",
@@ -21,9 +23,9 @@ function on_match(ctx)
         ctx.system_id,
         ctx.component_id,
         ctx.message_type,
-        msg.target_system or 0,
-        msg.target_component or 0,
-        tostring(msg.command or "unknown"),
+        cmd.target_system or 0,
+        cmd.target_component or 0,
+        tostring(cmd.command or "unknown"),
         os.time()
     )
 

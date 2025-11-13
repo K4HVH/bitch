@@ -73,10 +73,6 @@ pub struct CommandRule {
     /// The type of MAVLINK message (e.g., "COMMAND_LONG", "MISSION_ITEM")
     pub message_type: String,
 
-    /// Optional: The specific command name (for COMMAND_LONG)
-    /// e.g., "MAV_CMD_COMPONENT_ARM_DISARM", "MAV_CMD_NAV_TAKEOFF"
-    pub command: Option<String>,
-
     /// Optional: Conditions that must match for this rule to apply
     #[serde(default)]
     pub conditions: RuleConditions,
@@ -110,13 +106,30 @@ pub struct CommandRule {
     #[serde(default = "default_batch_key")]
     pub batch_key: String,
 
+    /// Optional: Field name in message to use as batch system_id (e.g., "target_system")
+    /// If not specified, uses header.system_id. Works for ANY message type.
+    pub batch_system_id_field: Option<String>,
+
     /// Optional: List of plugins to execute when this rule matches
     #[serde(default)]
     pub plugins: Vec<String>,
 
-    /// Optional: Automatically send COMMAND_ACK to GCS (for COMMAND_LONG messages)
+    /// Optional: Automatically send ACK response to GCS (works for ANY message type)
     #[serde(default)]
     pub auto_ack: bool,
+
+    /// Optional: Message type to send as ACK (e.g., "COMMAND_ACK", "MISSION_ACK")
+    pub ack_message_type: Option<String>,
+
+    /// Optional: Fields to set in ACK message (generic key-value pairs)
+    #[serde(default)]
+    pub ack_fields: HashMap<String, toml::Value>,
+
+    /// Optional: Field name in matched message to use as ACK source system_id (e.g., "target_system")
+    pub ack_source_system_field: Option<String>,
+
+    /// Optional: Field name in matched message to use as ACK source component_id (e.g., "target_component")
+    pub ack_source_component_field: Option<String>,
 
     /// Optional: Lua modifier script name (for action = "modify")
     pub modifier: Option<String>,
@@ -149,24 +162,15 @@ impl CommandRule {
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct RuleConditions {
-    /// Match specific parameter values (e.g., param1 = 1.0 for ARM)
-    pub param1: Option<f32>,
-    pub param2: Option<f32>,
-    pub param3: Option<f32>,
-    pub param4: Option<f32>,
-    pub param5: Option<f32>,
-    pub param6: Option<f32>,
-    pub param7: Option<f32>,
-
     /// Match specific system IDs
     pub system_id: Option<u8>,
 
     /// Match specific component IDs
     pub component_id: Option<u8>,
 
-    /// Custom conditions (future use)
+    /// Generic field conditions - works for ALL message types
+    /// Example: param1 = 1.0, altitude = 100, fix_type = 3, etc.
     #[serde(flatten)]
-    #[allow(dead_code)]
     pub custom: HashMap<String, toml::Value>,
 }
 
@@ -247,6 +251,28 @@ impl Config {
                     "Rule {} has 'modify' action but no modifier specified",
                     idx
                 );
+            }
+
+            // Validate auto_ack requirements
+            if rule.auto_ack {
+                if rule.ack_message_type.is_none() {
+                    anyhow::bail!(
+                        "Rule {} has auto_ack enabled but no ack_message_type specified",
+                        idx
+                    );
+                }
+                if rule.ack_source_system_field.is_none() {
+                    anyhow::bail!(
+                        "Rule {} has auto_ack enabled but no ack_source_system_field specified",
+                        idx
+                    );
+                }
+                if rule.ack_source_component_field.is_none() {
+                    anyhow::bail!(
+                        "Rule {} has auto_ack enabled but no ack_source_component_field specified",
+                        idx
+                    );
+                }
             }
         }
 

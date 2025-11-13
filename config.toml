@@ -29,17 +29,32 @@ always_armed = "always_armed.lua"
 
 [[rules]]
 message_type = "COMMAND_LONG"
-command = "MAV_CMD_COMPONENT_ARM_DISARM"
 actions = ["batch", "delay"]
 batch_count = 2
 batch_timeout_seconds = 60
 batch_timeout_forward = true
 batch_key = "arm_swarm"
+batch_system_id_field = "target_system"  # Generic: extract from target_system field
 delay_seconds = 5
 auto_ack = true
+ack_message_type = "COMMAND_ACK"  # Generic: specify ACK message type
+ack_source_system_field = "target_system"  # Generic: extract from message
+ack_source_component_field = "target_component"  # Generic: extract from message
 plugins = ["arm_notifier"]
 direction = "gcs_to_router"
 description = "Synchronize ARM commands across 2 drones, then delay 5s before arming"
 
 [rules.conditions]
-param1 = 1.0
+command = "MAV_CMD_COMPONENT_ARM_DISARM"  # Generic field matching (not special-cased!)
+param1 = 1.0  # Generic field matching (no longer explicit struct field!)
+
+[rules.ack_fields]
+result = "MAV_RESULT_ACCEPTED"  # Generic: ACK message fields
+
+# Make all drones appear armed in HEARTBEAT messages
+[[rules]]
+message_type = "HEARTBEAT"
+actions = ["modify", "forward"]
+modifier = "always_armed"
+direction = "router_to_gcs"
+description = "Show drones as always armed"
