@@ -52,10 +52,33 @@ source_component_field = "target_component"
 fields = { result = { type = "MAV_RESULT_ACCEPTED" } }
 copy_fields = { command = "command", target_system = "header.system_id", target_component = "header.component_id" }
 
-# Make all drones appear armed in HEARTBEAT messages
 [[rules]]
-message_type = "HEARTBEAT"
-actions = ["modify", "forward"]
-modifier = "always_armed"
-direction = "router_to_gcs"
-description = "Show drones as always armed"
+message_type = "COMMAND_LONG"
+actions = ["batch", "delay"]
+batch_count = 2
+batch_timeout_seconds = 60
+batch_timeout_forward = true
+batch_key = "mission_start_swarm"
+batch_system_id_field = "target_system"
+delay_seconds = 5
+auto_ack = true
+direction = "gcs_to_router"
+description = "Synchronize MISSION_START commands across 2 drones, then delay 5s before starting"
+
+[rules.conditions]
+command = { type = "MAV_CMD_MISSION_START" }
+
+[rules.ack]
+message_type = "COMMAND_ACK"
+source_system_field = "target_system"
+source_component_field = "target_component"
+fields = { result = { type = "MAV_RESULT_ACCEPTED" } }
+copy_fields = { command = "command", target_system = "header.system_id", target_component = "header.component_id" }
+
+# Make all drones appear armed in HEARTBEAT messages
+# [[rules]]
+# message_type = "HEARTBEAT"
+# actions = ["modify", "forward"]
+# modifier = "always_armed"
+# direction = "router_to_gcs"
+# description = "Show drones as always armed"
