@@ -1,7 +1,7 @@
 mod api;
 
 use anyhow::{Context, Result};
-use mlua::{Lua, Value};
+use mlua::{Lua, LuaSerdeExt, Value};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -59,35 +59,11 @@ impl PluginManager {
         // Create a fresh environment for this execution
         let globals = self.lua.globals();
 
-        // Set the context table
-        let context_table = self.lua.create_table()
-            .map_err(|e| anyhow::anyhow!("Failed to create context table: {}", e))?;
+        // Serialize context to Lua table using serde (supports ALL message types automatically)
+        let context_value = self.lua.to_value(context)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize context: {}", e))?;
 
-        context_table.set("target_system", context.target_system)
-            .map_err(|e| anyhow::anyhow!("Failed to set target_system: {}", e))?;
-        context_table.set("target_component", context.target_component)
-            .map_err(|e| anyhow::anyhow!("Failed to set target_component: {}", e))?;
-        context_table.set("message_type", context.message_type.clone())
-            .map_err(|e| anyhow::anyhow!("Failed to set message_type: {}", e))?;
-
-        if let Some(cmd) = &context.command {
-            context_table.set("command", cmd.clone())
-                .map_err(|e| anyhow::anyhow!("Failed to set command: {}", e))?;
-        }
-
-        // Set parameters if available
-        if let Some(params) = &context.params {
-            let params_table = self.lua.create_table()
-                .map_err(|e| anyhow::anyhow!("Failed to create params table: {}", e))?;
-            for (i, value) in params.iter().enumerate() {
-                params_table.set(i + 1, *value)
-                    .map_err(|e| anyhow::anyhow!("Failed to set param {}: {}", i + 1, e))?;
-            }
-            context_table.set("params", params_table)
-                .map_err(|e| anyhow::anyhow!("Failed to set params: {}", e))?;
-        }
-
-        globals.set("context", context_table)
+        globals.set("context", context_value)
             .map_err(|e| anyhow::anyhow!("Failed to set context global: {}", e))?;
 
         // Execute the plugin code

@@ -6,15 +6,19 @@ mod util;
 use anyhow::Result;
 use mlua::Lua;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 
 /// Context passed to plugins when a rule matches
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginContext {
-    pub target_system: u8,
-    pub target_component: u8,
+    /// MAVLink header system ID
+    pub system_id: u8,
+    /// MAVLink header component ID
+    pub component_id: u8,
+    /// Message type name (e.g., "COMMAND_LONG", "HEARTBEAT")
     pub message_type: String,
-    pub command: Option<String>,
-    pub params: Option<Vec<f32>>,
+    /// Full message data (works for ALL message types)
+    pub message: JsonValue,
 }
 
 /// Initialize all Lua APIs

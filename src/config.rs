@@ -10,6 +10,8 @@ pub struct Config {
     #[serde(default)]
     pub plugins: PluginsConfig,
     #[serde(default)]
+    pub modifiers: ModifiersConfig,
+    #[serde(default)]
     pub rules: Vec<CommandRule>,
 }
 
@@ -23,8 +25,22 @@ pub struct PluginsConfig {
     pub load: HashMap<String, String>,
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ModifiersConfig {
+    /// Directory containing modifier files
+    #[serde(default = "default_modifiers_dir")]
+    pub directory: String,
+    /// List of modifiers to load (name -> filename)
+    #[serde(default)]
+    pub load: HashMap<String, String>,
+}
+
 fn default_plugins_dir() -> String {
     "plugins".to_string()
+}
+
+fn default_modifiers_dir() -> String {
+    "modifiers".to_string()
 }
 
 fn default_batch_timeout_forward() -> bool {
@@ -33,6 +49,10 @@ fn default_batch_timeout_forward() -> bool {
 
 fn default_batch_key() -> String {
     "default".to_string()
+}
+
+fn default_direction() -> String {
+    "gcs_to_router".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -98,12 +118,20 @@ pub struct CommandRule {
     #[serde(default)]
     pub auto_ack: bool,
 
+    /// Optional: Lua modifier script name (for action = "modify")
+    pub modifier: Option<String>,
+
     /// Optional: Human-readable description
     pub description: Option<String>,
 
     /// Optional: Priority (higher = checked first). Default: 0
     #[serde(default)]
     pub priority: i32,
+
+    /// Optional: Message flow direction this rule applies to
+    /// "gcs_to_router" (default), "router_to_gcs", or "both"
+    #[serde(default = "default_direction")]
+    pub direction: String,
 }
 
 impl CommandRule {
@@ -182,6 +210,15 @@ impl Config {
                 }
             }
 
+            // Validate direction field
+            if !["gcs_to_router", "router_to_gcs", "both"].contains(&rule.direction.as_str()) {
+                anyhow::bail!(
+                    "Rule {} has invalid direction '{}'. Must be: gcs_to_router, router_to_gcs, or both",
+                    idx,
+                    rule.direction
+                );
+            }
+
             // Validate action-specific requirements
             if actions.contains(&"delay".to_string()) && rule.delay_seconds.is_none() {
                 anyhow::bail!(
@@ -203,6 +240,13 @@ impl Config {
                         idx
                     );
                 }
+            }
+
+            if actions.contains(&"modify".to_string()) && rule.modifier.is_none() {
+                anyhow::bail!(
+                    "Rule {} has 'modify' action but no modifier specified",
+                    idx
+                );
             }
         }
 

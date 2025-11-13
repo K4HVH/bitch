@@ -1,5 +1,6 @@
 mod batch;
 mod config;
+mod modifiers;
 mod plugins;
 mod proxy;
 mod rules;
@@ -10,6 +11,7 @@ use tracing::{info, warn};
 use tracing_subscriber::filter::LevelFilter;
 
 use crate::config::Config;
+use crate::modifiers::ModifierManager;
 use crate::plugins::PluginManager;
 use crate::proxy::ProxyServer;
 
@@ -34,8 +36,20 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Initialize modifier manager
+    let mut modifier_manager = ModifierManager::new()?;
+
+    // Load modifiers
+    for (name, filename) in &config.modifiers.load {
+        let path = PathBuf::from(&config.modifiers.directory).join(filename);
+        match modifier_manager.load_modifier(name, &path) {
+            Ok(_) => info!("Loaded modifier: {}", name),
+            Err(e) => warn!("Failed to load modifier '{}': {}", name, e),
+        }
+    }
+
     // Create and run the proxy server
-    let server = ProxyServer::new(config, plugin_manager)?;
+    let server = ProxyServer::new(config, plugin_manager, modifier_manager)?;
     server.run().await
 }
 

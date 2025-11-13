@@ -4,19 +4,26 @@
 function on_match(ctx)
     log.info("Sending webhook notification")
 
+    -- For COMMAND_LONG messages, the fields are directly in ctx.message
+    local msg = ctx.message
+    
     -- Build JSON payload
     local payload = string.format([[{
         "event": "arm_command",
+        "system_id": %d,
+        "component_id": %d,
+        "message_type": "%s",
         "target_system": %d,
         "target_component": %d,
-        "message_type": "%s",
         "command": "%s",
         "timestamp": %d
     }]],
-        ctx.target_system,
-        ctx.target_component,
+        ctx.system_id,
+        ctx.component_id,
         ctx.message_type,
-        ctx.command or "unknown",
+        msg.target_system or 0,
+        msg.target_component or 0,
+        tostring(msg.command or "unknown"),
         os.time()
     )
 

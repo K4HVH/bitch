@@ -1,5 +1,6 @@
-use crate::batch::{BatchManager, BatchResult};
+use crate::batch::{BatchManager, BatchResult, Destination};
 use crate::config::Config;
+use crate::modifiers::ModifierManager;
 use crate::plugins::PluginManager;
 use crate::rules::{parse_mavlink_message, Action, AckInfo, ProcessResult, RuleEngine};
 use anyhow::{Context, Result};
@@ -37,8 +38,12 @@ pub struct ProxyServer {
 }
 
 impl ProxyServer {
-    pub fn new(config: Config, plugin_manager: PluginManager) -> Result<Self> {
-        let rule_engine = RuleEngine::new(config.rules.clone(), plugin_manager)?;
+    pub fn new(
+        config: Config,
+        plugin_manager: PluginManager,
+        modifier_manager: ModifierManager,
+    ) -> Result<Self> {
+        let rule_engine = RuleEngine::new(config.rules.clone(), plugin_manager, modifier_manager)?;
 
         Ok(Self {
             config: Arc::new(config),
@@ -51,25 +56,34 @@ impl ProxyServer {
     async fn execute_actions(
         actions: Vec<Action>,
         packet: Vec<u8>,
-        router_socket: Arc<UdpSocket>,
+        destination: Destination,
         state: Arc<ProxyState>,
     ) {
-        Self::execute_actions_impl(actions, vec![packet], router_socket, state).await;
+        Self::execute_actions_impl(actions, vec![packet], destination, state).await;
     }
 
     /// Execute a sequence of actions on multiple packets
     fn execute_actions_impl(
         mut actions: Vec<Action>,
         packets: Vec<Vec<u8>>,
-        router_socket: Arc<UdpSocket>,
+        destination: Destination,
         state: Arc<ProxyState>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         Box::pin(async move {
         if actions.is_empty() {
             // No actions, forward all packets
             for packet in packets {
-                if let Err(e) = router_socket.send(&packet).await {
-                    error!("Failed to forward packet: {}", e);
+                match &destination {
+                    Destination::Router(socket) => {
+                        if let Err(e) = socket.send(&packet).await {
+                            error!("Failed to forward packet to router: {}", e);
+                        }
+                    }
+                    Destination::Gcs(socket, addr) => {
+                        if let Err(e) = socket.send_to(&packet, addr).await {
+                            error!("Failed to forward packet to GCS: {}", e);
+                        }
+                    }
                 }
             }
             return;
@@ -82,11 +96,62 @@ impl ProxyServer {
         match action {
             Action::Forward => {
                 // Forward and continue with remaining actions
-                Self::execute_actions_impl(remaining_actions, packets, router_socket, state).await;
+                Self::execute_actions_impl(remaining_actions, packets, destination, state).await;
             }
             Action::Block => {
                 warn!("Message(s) blocked by rule");
                 // Don't process remaining actions
+            }
+            Action::Modify {
+                modifier,
+                modified_message,
+            } => {
+                // Modify action: replace message content with modified version
+                if let Some(modified_msg) = modified_message {
+                    let direction_label = match &destination {
+                        Destination::Router(_) => "GCS->Router",
+                        Destination::Gcs(_, _) => "Router->GCS",
+                    };
+                    info!("Applying modification from '{}' ({})", modifier, direction_label);
+
+                    // Reconstruct packet with modified message
+                    let mut modified_packets = Vec::new();
+
+                    for packet in packets {
+                        // Parse original packet to get header
+                        if let Ok((header, _original_msg)) = parse_mavlink_message(&packet) {
+                            // Serialize modified message
+                            let mut buf = Vec::new();
+                            if let Err(e) = mavlink::write_versioned_msg(
+                                &mut buf,
+                                MavlinkVersion::V2,
+                                header,
+                                &modified_msg,
+                            ) {
+                                error!("Failed to serialize modified message: {}", e);
+                                modified_packets.push(packet); // Use original on error
+                            } else {
+                                modified_packets.push(buf);
+                            }
+                        } else {
+                            warn!("Failed to parse packet for modification, using original");
+                            modified_packets.push(packet);
+                        }
+                    }
+
+                    // Continue with remaining actions using modified packets
+                    Self::execute_actions_impl(
+                        remaining_actions,
+                        modified_packets,
+                        destination,
+                        state,
+                    )
+                    .await;
+                } else {
+                    warn!("Modify action has no modified message, forwarding original");
+                    Self::execute_actions_impl(remaining_actions, packets, destination, state)
+                        .await;
+                }
             }
             Action::Delay(duration) => {
                 // Spawn task to delay then continue with remaining actions
@@ -98,7 +163,7 @@ impl ProxyServer {
 
                 tokio::spawn(async move {
                     sleep(duration).await;
-                    Self::execute_actions_impl(remaining_actions, packets, router_socket, state)
+                    Self::execute_actions_impl(remaining_actions, packets, destination, state)
                         .await;
                     info!("Delayed message(s) forwarded after {}s", delay_secs);
                 });
@@ -136,7 +201,7 @@ impl ProxyServer {
                         timeout,
                         forward_on_timeout,
                         remaining_actions.clone(),
-                        router_socket.clone(),
+                        destination.clone(),
                     )
                     .await;
 
@@ -158,7 +223,7 @@ impl ProxyServer {
                         Self::execute_actions_impl(
                             remaining_actions,
                             packets,
-                            router_socket,
+                            destination,
                             state,
                         )
                         .await;
@@ -268,9 +333,10 @@ impl ProxyServer {
             let gcs_socket = gcs_socket.clone();
             let router_socket = router_socket.clone();
             let state = self.state.clone();
+            let rule_engine = self.rule_engine.clone();
 
             tokio::spawn(async move {
-                Self::forward_router_to_gcs(router_socket, gcs_socket, state).await
+                Self::forward_router_to_gcs(router_socket, gcs_socket, state, rule_engine).await
             })
         };
 
@@ -315,7 +381,7 @@ impl ProxyServer {
 
                     // Try to parse and process the MAVLink message
                     let result = if let Ok((header, msg)) = parse_mavlink_message(packet) {
-                        rule_engine.process_message(&header, &msg)
+                        rule_engine.process_message_with_direction(&header, &msg, "gcs_to_router")
                     } else {
                         // If we can't parse it, forward it anyway
                         debug!("Failed to parse message, forwarding anyway");
@@ -343,7 +409,7 @@ impl ProxyServer {
                     Self::execute_actions(
                         result.actions,
                         packet.to_vec(),
-                        router_socket.clone(),
+                        Destination::Router(router_socket.clone()),
                         state.clone(),
                     )
                     .await;
@@ -360,6 +426,7 @@ impl ProxyServer {
         router_socket: Arc<UdpSocket>,
         gcs_socket: Arc<UdpSocket>,
         state: Arc<ProxyState>,
+        rule_engine: Arc<RuleEngine>,
     ) -> Result<()> {
         let mut buf = vec![0u8; 65535];
 
@@ -374,9 +441,28 @@ impl ProxyServer {
                     let gcs_addr = state.gcs_addr.read().await;
 
                     if let Some(addr) = *gcs_addr {
-                        if let Err(e) = gcs_socket.send_to(&buf[..len], addr).await {
-                            error!("Failed to forward to GCS: {}", e);
-                        }
+                        let packet = &buf[..len];
+
+                        // Try to parse and process the MAVLink message
+                        let result = if let Ok((header, msg)) = parse_mavlink_message(packet) {
+                            rule_engine.process_message_with_direction(&header, &msg, "router_to_gcs")
+                        } else {
+                            // If we can't parse it, forward it anyway
+                            debug!("Failed to parse Router->GCS message, forwarding anyway");
+                            ProcessResult {
+                                actions: vec![Action::Forward],
+                                ack_info: None,
+                            }
+                        };
+
+                        // Execute action sequence (router->GCS direction)
+                        Self::execute_actions(
+                            result.actions,
+                            packet.to_vec(),
+                            Destination::Gcs(gcs_socket.clone(), addr),
+                            state.clone(),
+                        )
+                        .await;
                     } else {
                         debug!("No GCS connected, dropping packet");
                     }

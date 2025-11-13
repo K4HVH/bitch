@@ -1,12 +1,9 @@
 # BITCH Configuration
-# MAVLINK command interceptor and modifier
+# See DOCUMENTATION.md for complete documentation
 
 [network]
-# Port to listen on for GCS (Mission Planner) connections
 gcs_listen_port = 14550
 gcs_listen_address = "0.0.0.0"
-
-# Mavlink-router connection
 router_address = "127.0.0.1"
 router_port = 14551
 
@@ -16,149 +13,33 @@ level = "info"  # trace, debug, info, warn, error
 [plugins]
 directory = "plugins"
 
-# Plugins to load at startup (name = filename)
 [plugins.load]
 arm_notifier = "arm_notifier.lua"
 # webhook_example = "webhook_example.lua"
 
-# ============================================================================
-# COMMAND RULES
-# ============================================================================
-# Rules are processed in priority order (highest priority first).
-# The first matching rule determines the action for a message.
-#
-# Available actions: "delay", "block", "forward", "modify", "batch"
-# Available message_type: "COMMAND_LONG", "HEARTBEAT", "MISSION_ITEM", etc.
-#
-# For COMMAND_LONG, specify the command name:
-#   - command: "MAV_CMD_COMPONENT_ARM_DISARM", "MAV_CMD_NAV_TAKEOFF", etc.
-#
-# Conditions can match on:
-#   - param1-7: Parameter values
-#   - system_id: Specific system ID
-#   - component_id: Specific component ID
-#
-# Note: Messages that don't match any rule are forwarded immediately by default
-# ============================================================================
+[modifiers]
+directory = "modifiers"
 
-# Batch ARM commands across multiple drones, then delay before releasing
-# (DISARM commands with param1=0.0 won't match this rule and pass through immediately)
+[modifiers.load]
+always_armed = "always_armed.lua"
+
+# Rules - See DOCUMENTATION.md for complete rule system documentation
+# Direction: "gcs_to_router" (default), "router_to_gcs", or "both"
+# Actions: forward, block, modify, delay, batch
+
 [[rules]]
 message_type = "COMMAND_LONG"
 command = "MAV_CMD_COMPONENT_ARM_DISARM"
-actions = ["batch", "delay"]      # First batch, then delay all packets
-batch_count = 2                    # Wait for 2 unique drones to send ARM
-batch_timeout_seconds = 60         # Timeout after 60 seconds
-batch_timeout_forward = true       # Forward on timeout even if threshold not met
-batch_key = "arm_swarm"           # Batch group identifier
-delay_seconds = 5                  # Delay after batch completes
-auto_ack = true                   # Send immediate COMMAND_ACK to GCS so it doesn't wait
-plugins = ["arm_notifier"]        # Execute these plugins when rule matches
+actions = ["batch", "delay"]
+batch_count = 2
+batch_timeout_seconds = 60
+batch_timeout_forward = true
+batch_key = "arm_swarm"
+delay_seconds = 5
+auto_ack = true
+plugins = ["arm_notifier"]
+direction = "gcs_to_router"
 description = "Synchronize ARM commands across 2 drones, then delay 5s before arming"
 
 [rules.conditions]
 param1 = 1.0
-
-# ============================================================================
-# EXAMPLE RULES (commented out)
-# ============================================================================
-
-# Block all mode change commands
-# [[rules]]
-# message_type = "COMMAND_LONG"
-# command = "MAV_CMD_DO_SET_MODE"
-# action = "block"
-# description = "Block mode change commands"
-# priority = 10
-
-# Delay mission start by 5 seconds
-# [[rules]]
-# message_type = "COMMAND_LONG"
-# command = "MAV_CMD_MISSION_START"
-# action = "delay"
-# delay_seconds = 5
-# description = "Delay mission start"
-# priority = 10
-
-# Block takeoff commands from a specific system
-# [[rules]]
-# message_type = "COMMAND_LONG"
-# command = "MAV_CMD_NAV_TAKEOFF"
-# action = "block"
-# description = "Block takeoff from system 1"
-# priority = 10
-#
-# [rules.conditions]
-# system_id = 1
-
-# Delay waypoint commands with specific parameters
-# [[rules]]
-# message_type = "COMMAND_LONG"
-# command = "MAV_CMD_NAV_WAYPOINT"
-# action = "delay"
-# delay_seconds = 3
-# description = "Delay waypoint commands"
-# priority = 5
-#
-# [rules.conditions]
-# param1 = 0.0  # Hold time
-
-# ============================================================================
-# PLUGIN SYSTEM
-# ============================================================================
-# Plugins are Lua scripts that execute when rules match. They have access to:
-#
-# - context.target_system    - Target system ID
-# - context.target_component - Target component ID
-# - context.message_type     - MAVLINK message type (e.g., "COMMAND_LONG")
-# - context.command          - Command name (e.g., "MAV_CMD_COMPONENT_ARM_DISARM")
-# - context.params           - Array of parameters [param1..param7]
-#
-# Available APIs:
-#   log.info(msg), log.warn(msg), log.error(msg), log.debug(msg)
-#   serial.write(port, baudrate, data, [timeout_ms])
-#   serial.write_line(port, baudrate, data, [timeout_ms])
-#   http.get(url, [headers])
-#   http.post(url, body, [headers])
-#   util.sleep(milliseconds)
-#   util.file_write(path, content)
-#   util.file_read(path)
-#
-# Example plugin usage:
-# plugins = ["arm_notifier", "webhook_example"]
-#
-# AUTO-ACK FEATURE:
-# Set auto_ack = true on COMMAND_LONG rules to automatically send COMMAND_ACK
-# back to the GCS. This prevents the GCS from waiting for the delayed command
-# to complete. The ACK is sent immediately with MAV_RESULT_ACCEPTED.
-# Example: auto_ack = true
-#
-# BATCH FEATURE:
-# Set action = "batch" to synchronize commands across multiple drones.
-# The batch system waits until N unique system IDs send the matching command,
-# then forwards all queued messages simultaneously.
-#
-# Required fields for batch action:
-#   batch_count             - Number of unique system IDs to wait for
-#   batch_timeout_seconds   - Maximum time to wait before timeout
-#
-# Optional fields:
-#   batch_timeout_forward   - Forward on timeout (default: true) or drop
-#   batch_key              - Batch group identifier (default: "default")
-#                            Use different keys for independent batch groups
-#
-# Example: Synchronize arming across 3 drones
-# [[rules]]
-# message_type = "COMMAND_LONG"
-# command = "MAV_CMD_COMPONENT_ARM_DISARM"
-# action = "batch"
-# batch_count = 3
-# batch_timeout_seconds = 30
-# batch_timeout_forward = true
-# batch_key = "arm_swarm"
-# auto_ack = true
-# description = "Synchronize ARM commands across 3 drones"
-#
-# [rules.conditions]
-# param1 = 1.0  # Only ARM (not DISARM)
-# ============================================================================

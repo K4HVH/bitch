@@ -1,11 +1,21 @@
 use crate::rules::Action;
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use tokio::time::{sleep, Instant};
 use tracing::{debug, error, info, warn};
+
+/// Destination for forwarding packets
+#[derive(Clone)]
+pub enum Destination {
+    /// Send to Router (connected socket, no address needed)
+    Router(Arc<UdpSocket>),
+    /// Send to GCS (need socket and address)
+    Gcs(Arc<UdpSocket>, SocketAddr),
+}
 
 /// Result of queuing a message to a batch
 #[derive(Debug)]
@@ -88,7 +98,7 @@ impl BatchManager {
         timeout: Duration,
         forward_on_timeout: bool,
         remaining_actions: Vec<Action>,
-        router_socket: Arc<UdpSocket>,
+        destination: Destination,
     ) -> BatchResult {
         let mut batches = self.batches.write().await;
 
@@ -106,10 +116,10 @@ impl BatchManager {
                 // Spawn timeout handler
                 let batches_clone = self.batches.clone();
                 let key_clone = key.clone();
-                let router_socket_clone = router_socket.clone();
+                let destination_clone = destination.clone();
                 tokio::spawn(async move {
                     sleep(timeout).await;
-                    Self::handle_timeout(batches_clone, key_clone, router_socket_clone).await;
+                    Self::handle_timeout(batches_clone, key_clone, destination_clone).await;
                 });
 
                 BatchState::new(threshold, forward_on_timeout, remaining_actions.clone())
@@ -149,7 +159,7 @@ impl BatchManager {
     async fn handle_timeout(
         batches: Arc<RwLock<HashMap<String, BatchState>>>,
         key: String,
-        router_socket: Arc<UdpSocket>,
+        destination: Destination,
     ) {
         let mut batches = batches.write().await;
 
@@ -167,8 +177,17 @@ impl BatchManager {
                 // Forward all packets (timeout doesn't apply remaining actions - just forwards)
                 let (packets, _remaining_actions) = batch.release();
                 for packet in packets {
-                    if let Err(e) = router_socket.send(&packet).await {
-                        error!("Failed to send timed-out batch packet: {}", e);
+                    match &destination {
+                        Destination::Router(socket) => {
+                            if let Err(e) = socket.send(&packet).await {
+                                error!("Failed to send timed-out batch packet to router: {}", e);
+                            }
+                        }
+                        Destination::Gcs(socket, addr) => {
+                            if let Err(e) = socket.send_to(&packet, addr).await {
+                                error!("Failed to send timed-out batch packet to GCS: {}", e);
+                            }
+                        }
                     }
                 }
                 info!("Forwarded {} timed-out packets", packet_count);
