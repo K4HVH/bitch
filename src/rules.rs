@@ -21,6 +21,12 @@ pub struct AckInfo {
     pub source_component: u8,
     /// Fields to set in the ACK message (generic key-value pairs)
     pub fields: HashMap<String, toml::Value>,
+    /// Fields to copy from original message (ACK field -> original field path)
+    pub copy_fields: HashMap<String, String>,
+    /// Original message header (for extracting GCS system/component IDs)
+    pub original_header: MavHeader,
+    /// Original message data as JSON (for extracting fields)
+    pub original_message: JsonValue,
 }
 
 /// Result of processing a message through the rule engine
@@ -31,6 +37,7 @@ pub struct ProcessResult {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum Action {
     /// Forward the message immediately
     Forward,
@@ -139,8 +146,7 @@ impl RuleEngine {
     fn build_plugin_context(&self, header: &MavHeader, msg: &MavMessage) -> PluginContext {
         let message_type = get_message_name(msg);
 
-        // Serialize the full message to JSON (keeps nested structure)
-        // MavMessage serializes as {MESSAGE_TYPE: {fields...}}
+        // Serialize message to JSON (mavlink internally-tagged format)
         let message_json = serde_json::to_value(msg)
             .unwrap_or_else(|_| serde_json::json!({}));
 
@@ -165,8 +171,8 @@ impl RuleEngine {
             return false;
         }
 
-        // Serialize message to JSON for generic field access
-        let msg_json = match serde_json::to_value(msg) {
+        // Serialize message to JSON (mavlink internally-tagged format)
+        let message_json = match serde_json::to_value(msg) {
             Ok(val) => val,
             Err(e) => {
                 warn!("Failed to serialize message for condition checking: {}", e);
@@ -174,8 +180,8 @@ impl RuleEngine {
             }
         };
 
-        // Check conditions (command field can be checked via conditions.custom like any other field)
-        if !self.matches_conditions(header, &msg_json, &msg_name, &rule.conditions) {
+        // Check conditions (fields accessed directly from internally-tagged format)
+        if !self.matches_conditions(header, &message_json, &rule.conditions) {
             return false;
         }
 
@@ -187,7 +193,6 @@ impl RuleEngine {
         &self,
         header: &MavHeader,
         msg_json: &JsonValue,
-        msg_type: &str,
         conditions: &RuleConditions,
     ) -> bool {
         // Check header conditions (work for all message types)
@@ -205,18 +210,10 @@ impl RuleEngine {
             }
         }
 
-        // Get the message data object (e.g., msg_json["COMMAND_LONG"])
-        let msg_data = match msg_json.get(msg_type) {
-            Some(data) => data,
-            None => {
-                debug!("Message data not found for type {}", msg_type);
-                return true; // No message-specific conditions to check
-            }
-        };
-
         // Check all field conditions generically (works for ALL message types)
+        // Fields accessed directly from internally-tagged format
         for (field_name, expected_value) in &conditions.custom {
-            if !self.check_field_condition(msg_data, field_name, expected_value) {
+            if !self.check_field_condition(msg_json, field_name, expected_value) {
                 return false;
             }
         }
@@ -248,16 +245,15 @@ impl RuleEngine {
                 }
             }
             toml::Value::String(expected) => {
-                // For string matching, handle both exact match and contains
-                if let Some(actual) = actual_value.as_str() {
-                    actual == expected || actual.contains(expected)
-                } else {
-                    // Also check if it's an enum/object that contains the string
-                    format!("{:?}", actual_value).contains(expected)
-                }
+                actual_value.as_str() == Some(expected)
             }
             toml::Value::Boolean(expected) => {
                 actual_value.as_bool() == Some(*expected)
+            }
+            toml::Value::Table(_) => {
+                // For tables (e.g., internally-tagged enums), convert to JSON and compare
+                let expected_json = toml_to_json_value(expected_value);
+                actual_value == &expected_json
             }
             _ => {
                 debug!("Unsupported condition value type for field '{}'", field_name);
@@ -339,14 +335,16 @@ impl RuleEngine {
     }
 
     /// Build ACK info generically from any message type
-    fn build_ack_info(&self, rule: &CommandRule, msg: &MavMessage, _header: &MavHeader) -> Option<AckInfo> {
-        // Validate that all required fields are present
-        let message_type = rule.ack_message_type.as_ref()?;
-        let source_system_field = rule.ack_source_system_field.as_ref()?;
-        let source_component_field = rule.ack_source_component_field.as_ref()?;
+    fn build_ack_info(&self, rule: &CommandRule, msg: &MavMessage, header: &MavHeader) -> Option<AckInfo> {
+        // Get ACK config
+        let ack_config = rule.ack.as_ref()?;
 
-        // Serialize message to JSON to extract fields
-        let full_json = match serde_json::to_value(msg) {
+        let message_type = &ack_config.message_type;
+        let source_system_field = &ack_config.source_system_field;
+        let source_component_field = &ack_config.source_component_field;
+
+        // Serialize message to JSON (mavlink internally-tagged format)
+        let message_json = match serde_json::to_value(msg) {
             Ok(val) => val,
             Err(e) => {
                 warn!("Failed to serialize message for ACK building: {}", e);
@@ -354,18 +352,8 @@ impl RuleEngine {
             }
         };
 
-        // Extract the inner message data (unwrap from enum variant)
-        let msg_type = get_message_name(msg);
-        let msg_data = match full_json.get(&msg_type) {
-            Some(data) => data,
-            None => {
-                warn!("Message data not found for ACK building (expected {}, got {:?})", msg_type, full_json);
-                return None;
-            }
-        };
-
         // Extract source system_id from specified field
-        let source_system = match msg_data.get(source_system_field) {
+        let source_system = match message_json.get(source_system_field) {
             Some(val) => match val.as_u64() {
                 Some(v) => v as u8,
                 None => {
@@ -380,7 +368,7 @@ impl RuleEngine {
         };
 
         // Extract source component_id from specified field
-        let source_component = match msg_data.get(source_component_field) {
+        let source_component = match message_json.get(source_component_field) {
             Some(val) => match val.as_u64() {
                 Some(v) => v as u8,
                 None => {
@@ -398,7 +386,10 @@ impl RuleEngine {
             message_type: message_type.clone(),
             source_system,
             source_component,
-            fields: rule.ack_fields.clone(),
+            fields: ack_config.fields.clone(),
+            copy_fields: ack_config.copy_fields.clone(),
+            original_header: *header,
+            original_message: message_json,
         })
     }
 }
@@ -433,5 +424,31 @@ pub fn get_message_name(msg: &MavMessage) -> String {
         .next()
         .unwrap_or("UNKNOWN")
         .to_string()
+}
+
+/// Convert TOML value to JSON value, preserving structure
+fn toml_to_json_value(value: &toml::Value) -> JsonValue {
+    match value {
+        toml::Value::String(s) => JsonValue::String(s.clone()),
+        toml::Value::Integer(i) => JsonValue::Number((*i).into()),
+        toml::Value::Float(f) => {
+            serde_json::Number::from_f64(*f)
+                .map(JsonValue::Number)
+                .unwrap_or(JsonValue::Null)
+        }
+        toml::Value::Boolean(b) => JsonValue::Bool(*b),
+        toml::Value::Array(arr) => {
+            let json_arr: Vec<JsonValue> = arr.iter().map(toml_to_json_value).collect();
+            JsonValue::Array(json_arr)
+        }
+        toml::Value::Table(table) => {
+            let mut json_obj = serde_json::Map::new();
+            for (k, v) in table {
+                json_obj.insert(k.clone(), toml_to_json_value(v));
+            }
+            JsonValue::Object(json_obj)
+        }
+        toml::Value::Datetime(dt) => JsonValue::String(dt.to_string()),
+    }
 }
 

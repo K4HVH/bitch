@@ -6,8 +6,8 @@ function on_match(ctx)
 
     local msg = ctx.message
 
-    -- Messages are serialized as {MESSAGE_TYPE = {fields...}}
-    local cmd = msg.COMMAND_LONG or {}
+    -- Messages use mavlink internally-tagged format: {type = "MESSAGE_TYPE", field1 = ..., field2 = ...}
+    -- Access fields directly from the message table
 
     -- Build JSON payload
     local payload = string.format([[{
@@ -23,9 +23,9 @@ function on_match(ctx)
         ctx.system_id,
         ctx.component_id,
         ctx.message_type,
-        cmd.target_system or 0,
-        cmd.target_component or 0,
-        tostring(cmd.command or "unknown"),
+        msg.target_system or 0,
+        msg.target_component or 0,
+        tostring(msg.command or "unknown"),
         os.time()
     )
 

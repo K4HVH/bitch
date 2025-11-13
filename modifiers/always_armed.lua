@@ -5,13 +5,11 @@
 function modify(ctx)
     local msg = ctx.message
 
-    -- Messages are serialized as {MESSAGE_TYPE = {fields...}}
-    if msg.HEARTBEAT then
-        local hb = msg.HEARTBEAT
-
+    -- Messages use mavlink internally-tagged format: {type = "MESSAGE_TYPE", field1 = ..., field2 = ...}
+    if msg.type == "HEARTBEAT" then
         -- base_mode is a table/enum with a 'bits' field containing the actual value
-        if hb.base_mode and hb.base_mode.bits then
-            local original_mode = hb.base_mode.bits
+        if msg.base_mode and msg.base_mode.bits then
+            local original_mode = msg.base_mode.bits
 
             -- MAV_MODE_FLAG_SAFETY_ARMED = 128 (0x80)
             -- Set bit 7 to indicate armed
@@ -24,9 +22,7 @@ function modify(ctx)
                     ctx.system_id, original_mode, new_mode, original_mode, new_mode))
             end
 
-            hb.base_mode.bits = new_mode
-            msg.HEARTBEAT = hb
-            ctx.message = msg
+            msg.base_mode.bits = new_mode
         else
             log.error("Could not access base_mode.bits field in HEARTBEAT message")
         end

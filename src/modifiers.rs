@@ -33,25 +33,25 @@ impl ModifierManager {
         let log_table = lua.create_table()?;
 
         let info = lua.create_function(|_, msg: String| {
-            tracing::info!("{}", msg);
+            tracing::info!("[Modifier] {}", msg);
             Ok(())
         })?;
         log_table.set("info", info)?;
 
         let warn = lua.create_function(|_, msg: String| {
-            tracing::warn!("{}", msg);
+            tracing::warn!("[Modifier] {}", msg);
             Ok(())
         })?;
         log_table.set("warn", warn)?;
 
         let error = lua.create_function(|_, msg: String| {
-            tracing::error!("{}", msg);
+            tracing::error!("[Modifier] {}", msg);
             Ok(())
         })?;
         log_table.set("error", error)?;
 
         let debug = lua.create_function(|_, msg: String| {
-            tracing::debug!("{}", msg);
+            tracing::debug!("[Modifier] {}", msg);
             Ok(())
         })?;
         log_table.set("debug", debug)?;
@@ -112,8 +112,12 @@ impl ModifierManager {
         context_table.set("message_type", message_type.as_str())
             .map_err(|e| anyhow::anyhow!("Failed to set message_type: {}", e))?;
 
-        // Serialize message to Lua table using mlua's serde support
-        let msg_value = self.lua.to_value(msg)
+        // Serialize message to JSON (mavlink internally-tagged format)
+        let message_json = serde_json::to_value(msg)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize message to JSON: {}", e))?;
+
+        // Convert JSON value to Lua value
+        let msg_value = self.lua.to_value(&message_json)
             .map_err(|e| anyhow::anyhow!("Failed to serialize message to Lua: {}", e))?;
 
         context_table.set("message", msg_value)
@@ -145,8 +149,12 @@ impl ModifierManager {
                 let modified_msg_value: Value = result_table.get("message")
                     .map_err(|e| anyhow::anyhow!("Failed to get modified message: {}", e))?;
 
-                // Deserialize back to MavMessage
-                let modified_msg: MavMessage = self.lua.from_value(modified_msg_value)
+                // Convert Lua value to JSON
+                let message_json: serde_json::Value = self.lua.from_value(modified_msg_value)
+                    .map_err(|e| anyhow::anyhow!("Failed to convert modified message to JSON: {}", e))?;
+
+                // Deserialize JSON to MavMessage (mavlink internally-tagged format)
+                let modified_msg: MavMessage = serde_json::from_value(message_json)
                     .map_err(|e| anyhow::anyhow!("Failed to deserialize modified message: {}", e))?;
 
                 Ok(modified_msg)

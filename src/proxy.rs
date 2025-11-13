@@ -240,50 +240,59 @@ impl ProxyServer {
 
     /// Extract system_id from a message field generically
     fn extract_system_id_from_message(msg: &MavMessage, field_name: &str) -> Option<u8> {
-        // Serialize message to JSON to extract field
-        let msg_json = serde_json::to_value(msg).ok()?;
+        // Serialize message to JSON (mavlink internally-tagged format)
+        let message_json = serde_json::to_value(msg).ok()?;
 
-        // Get message type name
-        let msg_type_str = format!("{:?}", msg);
-        let msg_type = msg_type_str.split('(').next().unwrap_or("UNKNOWN");
-        let msg_data = msg_json.get(msg_type)?;
-
-        // Extract field value
-        let field_value = msg_data.get(field_name)?;
+        // Extract field value directly
+        let field_value = message_json.get(field_name)?;
         field_value.as_u64().map(|v| v as u8)
     }
 
     /// Build a generic ACK message (works for ANY message type)
     fn build_ack(ack_info: &AckInfo) -> Result<Vec<u8>> {
-        // Convert TOML values to JSON values for serde
+        // Start with fields from config
         let mut fields_json = serde_json::Map::new();
-        for (key, value) in &ack_info.fields {
-            let json_value = match value {
-                toml::Value::String(s) => serde_json::Value::String(s.clone()),
-                toml::Value::Integer(i) => serde_json::Value::Number((*i).into()),
-                toml::Value::Float(f) => {
-                    serde_json::Number::from_f64(*f)
-                        .map(serde_json::Value::Number)
-                        .unwrap_or(serde_json::Value::Null)
+
+        // Add the type field for internally-tagged enum
+        fields_json.insert("type".to_string(), serde_json::Value::String(ack_info.message_type.clone()));
+
+        // Copy fields from original message based on config
+        for (ack_field, source_path) in &ack_info.copy_fields {
+            let value = if source_path.starts_with("header.") {
+                // Copy from header (e.g., "header.system_id")
+                let header_field = source_path.trim_start_matches("header.");
+                match header_field {
+                    "system_id" => Some(serde_json::json!(ack_info.original_header.system_id)),
+                    "component_id" => Some(serde_json::json!(ack_info.original_header.component_id)),
+                    "sequence" => Some(serde_json::json!(ack_info.original_header.sequence)),
+                    _ => {
+                        warn!("Unknown header field: {}", header_field);
+                        None
+                    }
                 }
-                toml::Value::Boolean(b) => serde_json::Value::Bool(*b),
-                _ => {
-                    warn!("Unsupported TOML value type in ack_fields");
-                    continue;
-                }
+            } else {
+                // Copy from message payload (mavlink internally-tagged format)
+                // Just copy the field as-is, preserving internally-tagged enum structure
+                ack_info.original_message.get(source_path).cloned()
             };
+
+            if let Some(val) = value {
+                fields_json.insert(ack_field.clone(), val);
+            } else {
+                warn!("Failed to copy field '{}' from '{}'", ack_field, source_path);
+            }
+        }
+
+        // Add configured fields (can override copied values)
+        for (key, value) in &ack_info.fields {
+            // Convert TOML value to JSON value directly (preserves structure)
+            let json_value = toml_to_json(value);
             fields_json.insert(key.clone(), json_value);
         }
 
-        // Build message structure: {MESSAGE_TYPE: {fields...}}
-        let mut msg_json = serde_json::Map::new();
-        msg_json.insert(
-            ack_info.message_type.clone(),
-            serde_json::Value::Object(fields_json),
-        );
-
-        // Deserialize to MavMessage
-        let msg: MavMessage = serde_json::from_value(serde_json::Value::Object(msg_json))
+        // Deserialize to MavMessage using internally-tagged format
+        let json_value = serde_json::Value::Object(fields_json);
+        let msg: MavMessage = serde_json::from_value(json_value)
             .context("Failed to deserialize ACK message from fields")?;
 
         // Build header - ACK appears to come FROM the target system
@@ -534,5 +543,31 @@ impl ProxyServer {
                 }
             }
         }
+    }
+}
+
+/// Convert TOML value to JSON value, preserving structure
+fn toml_to_json(value: &toml::Value) -> serde_json::Value {
+    match value {
+        toml::Value::String(s) => serde_json::Value::String(s.clone()),
+        toml::Value::Integer(i) => serde_json::Value::Number((*i).into()),
+        toml::Value::Float(f) => {
+            serde_json::Number::from_f64(*f)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null)
+        }
+        toml::Value::Boolean(b) => serde_json::Value::Bool(*b),
+        toml::Value::Array(arr) => {
+            let json_arr: Vec<serde_json::Value> = arr.iter().map(toml_to_json).collect();
+            serde_json::Value::Array(json_arr)
+        }
+        toml::Value::Table(table) => {
+            let mut json_obj = serde_json::Map::new();
+            for (k, v) in table {
+                json_obj.insert(k.clone(), toml_to_json(v));
+            }
+            serde_json::Value::Object(json_obj)
+        }
+        toml::Value::Datetime(dt) => serde_json::Value::String(dt.to_string()),
     }
 }

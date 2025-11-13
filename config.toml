@@ -34,22 +34,23 @@ batch_count = 2
 batch_timeout_seconds = 60
 batch_timeout_forward = true
 batch_key = "arm_swarm"
-batch_system_id_field = "target_system"  # Generic: extract from target_system field
+batch_system_id_field = "target_system"
 delay_seconds = 5
 auto_ack = true
-ack_message_type = "COMMAND_ACK"  # Generic: specify ACK message type
-ack_source_system_field = "target_system"  # Generic: extract from message
-ack_source_component_field = "target_component"  # Generic: extract from message
 plugins = ["arm_notifier"]
 direction = "gcs_to_router"
 description = "Synchronize ARM commands across 2 drones, then delay 5s before arming"
 
 [rules.conditions]
-command = "MAV_CMD_COMPONENT_ARM_DISARM"  # Generic field matching (not special-cased!)
-param1 = 1.0  # Generic field matching (no longer explicit struct field!)
+command = { type = "MAV_CMD_COMPONENT_ARM_DISARM" }
+param1 = 1.0
 
-[rules.ack_fields]
-result = "MAV_RESULT_ACCEPTED"  # Generic: ACK message fields
+[rules.ack]
+message_type = "COMMAND_ACK"
+source_system_field = "target_system"
+source_component_field = "target_component"
+fields = { result = { type = "MAV_RESULT_ACCEPTED" } }
+copy_fields = { command = "command", target_system = "header.system_id", target_component = "header.component_id" }
 
 # Make all drones appear armed in HEARTBEAT messages
 [[rules]]

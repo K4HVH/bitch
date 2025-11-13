@@ -69,6 +69,28 @@ pub struct LoggingConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct AutoAckConfig {
+    /// Message type to send as ACK (e.g., "COMMAND_ACK", "MISSION_ACK")
+    pub message_type: String,
+
+    /// Field name in matched message to use as ACK source system_id (e.g., "target_system")
+    pub source_system_field: String,
+
+    /// Field name in matched message to use as ACK source component_id (e.g., "target_component")
+    pub source_component_field: String,
+
+    /// Fields to set in ACK message (generic key-value pairs)
+    #[serde(default)]
+    pub fields: HashMap<String, toml::Value>,
+
+    /// Map of ACK field names to original message field names to copy
+    /// Example: {"command" = "command"}
+    /// Use "header.X" to copy from original message header
+    #[serde(default)]
+    pub copy_fields: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct CommandRule {
     /// The type of MAVLINK message (e.g., "COMMAND_LONG", "MISSION_ITEM")
     pub message_type: String,
@@ -118,18 +140,8 @@ pub struct CommandRule {
     #[serde(default)]
     pub auto_ack: bool,
 
-    /// Optional: Message type to send as ACK (e.g., "COMMAND_ACK", "MISSION_ACK")
-    pub ack_message_type: Option<String>,
-
-    /// Optional: Fields to set in ACK message (generic key-value pairs)
-    #[serde(default)]
-    pub ack_fields: HashMap<String, toml::Value>,
-
-    /// Optional: Field name in matched message to use as ACK source system_id (e.g., "target_system")
-    pub ack_source_system_field: Option<String>,
-
-    /// Optional: Field name in matched message to use as ACK source component_id (e.g., "target_component")
-    pub ack_source_component_field: Option<String>,
+    /// Optional: ACK configuration (all ACK settings in one place)
+    pub ack: Option<AutoAckConfig>,
 
     /// Optional: Lua modifier script name (for action = "modify")
     pub modifier: Option<String>,
@@ -254,25 +266,11 @@ impl Config {
             }
 
             // Validate auto_ack requirements
-            if rule.auto_ack {
-                if rule.ack_message_type.is_none() {
-                    anyhow::bail!(
-                        "Rule {} has auto_ack enabled but no ack_message_type specified",
-                        idx
-                    );
-                }
-                if rule.ack_source_system_field.is_none() {
-                    anyhow::bail!(
-                        "Rule {} has auto_ack enabled but no ack_source_system_field specified",
-                        idx
-                    );
-                }
-                if rule.ack_source_component_field.is_none() {
-                    anyhow::bail!(
-                        "Rule {} has auto_ack enabled but no ack_source_component_field specified",
-                        idx
-                    );
-                }
+            if rule.auto_ack && rule.ack.is_none() {
+                anyhow::bail!(
+                    "Rule {} has auto_ack enabled but no [rules.ack] section specified",
+                    idx
+                );
             }
         }
 
