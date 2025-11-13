@@ -31,8 +31,8 @@ always_armed = "always_armed.lua"
 name = "arm_sync"
 message_type = "COMMAND_LONG"
 actions = ["batch", "delay"]
-batch_count = 2
-batch_timeout_seconds = 60
+batch_count = 10
+batch_timeout_seconds = 120
 batch_timeout_forward = true
 batch_key = "arm_swarm"
 batch_system_id_field = "target_system"
@@ -53,7 +53,7 @@ source_component_field = "target_component"
 fields = { result = { type = "MAV_RESULT_ACCEPTED" } }
 copy_fields = { command = "command", target_system = "header.system_id", target_component = "header.component_id" }
 
-# Trigger: Activate always_armed rule for 60 seconds when drones ARM
+# Trigger: Activate always_armed rule for 120 seconds when drones ARM
 [rules.triggers]
 activate_rules = ["show_always_armed"]
 duration_seconds = 1
@@ -63,8 +63,8 @@ on_match = true
 name = "mission_start_sync"
 message_type = "COMMAND_LONG"
 actions = ["batch", "delay"]
-batch_count = 2
-batch_timeout_seconds = 60
+batch_count = 10
+batch_timeout_seconds = 120
 batch_timeout_forward = true
 batch_key = "mission_start_swarm"
 batch_system_id_field = "target_system"
@@ -83,7 +83,7 @@ fields = { result = { type = "MAV_RESULT_ACCEPTED" } }
 copy_fields = { command = "command", target_system = "header.system_id", target_component = "header.component_id" }
 
 # Make all drones appear armed in HEARTBEAT messages
-# Activated by ARM trigger for 60 seconds
+# Activated by ARM trigger for 1 second
 [[rules]]
 name = "show_always_armed"
 message_type = "HEARTBEAT"
