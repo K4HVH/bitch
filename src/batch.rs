@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use tokio::time::{sleep, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Destination for forwarding packets
 #[derive(Clone)]
@@ -99,6 +99,7 @@ impl BatchManager {
         forward_on_timeout: bool,
         remaining_actions: Vec<Action>,
         destination: Destination,
+        state: Arc<crate::proxy::ProxyState>,
     ) -> BatchResult {
         let mut batches = self.batches.write().await;
 
@@ -117,9 +118,10 @@ impl BatchManager {
                 let batches_clone = self.batches.clone();
                 let key_clone = key.clone();
                 let destination_clone = destination.clone();
+                let state_clone = state.clone();
                 tokio::spawn(async move {
                     sleep(timeout).await;
-                    Self::handle_timeout(batches_clone, key_clone, destination_clone).await;
+                    Self::handle_timeout(batches_clone, key_clone, destination_clone, state_clone).await;
                 });
 
                 BatchState::new(threshold, forward_on_timeout, remaining_actions.clone())
@@ -160,6 +162,7 @@ impl BatchManager {
         batches: Arc<RwLock<HashMap<String, BatchState>>>,
         key: String,
         destination: Destination,
+        state: Arc<crate::proxy::ProxyState>,
     ) {
         let mut batches = batches.write().await;
 
@@ -174,23 +177,22 @@ impl BatchManager {
                     key, elapsed, unique_count, batch.threshold, packet_count
                 );
 
-                // Forward all packets (timeout doesn't apply remaining actions - just forwards)
-                let (packets, _remaining_actions) = batch.release();
-                for packet in packets {
-                    match &destination {
-                        Destination::Router(socket) => {
-                            if let Err(e) = socket.send(&packet).await {
-                                error!("Failed to send timed-out batch packet to router: {}", e);
-                            }
-                        }
-                        Destination::Gcs(socket, addr) => {
-                            if let Err(e) = socket.send_to(&packet, addr).await {
-                                error!("Failed to send timed-out batch packet to GCS: {}", e);
-                            }
-                        }
-                    }
-                }
-                info!("Forwarded {} timed-out packets", packet_count);
+                // Execute remaining actions on timed-out packets (including delay, etc.)
+                let (packets, remaining_actions) = batch.release();
+                info!(
+                    "Forwarded {} timed-out packets, applying {} remaining action(s)",
+                    packet_count,
+                    remaining_actions.len()
+                );
+
+                // Continue the action chain for timed-out packets
+                crate::proxy::execute_actions_impl(
+                    remaining_actions,
+                    packets,
+                    destination,
+                    state,
+                )
+                .await;
             } else {
                 warn!(
                     "Batch '{}' timed out after {:?} with {}/{} systems ({} packets) - DROPPING",

@@ -67,6 +67,7 @@ pub struct RuleEngine {
     rules: Vec<CommandRule>,
     plugin_manager: Arc<PluginManager>,
     modifier_manager: Arc<ModifierManager>,
+    state_manager: Arc<crate::rule_state::RuleStateManager>,
 }
 
 impl RuleEngine {
@@ -74,11 +75,13 @@ impl RuleEngine {
         rules: Vec<CommandRule>,
         plugin_manager: PluginManager,
         modifier_manager: ModifierManager,
+        state_manager: Arc<crate::rule_state::RuleStateManager>,
     ) -> Result<Self> {
         Ok(Self {
             rules,
             plugin_manager: Arc::new(plugin_manager),
             modifier_manager: Arc::new(modifier_manager),
+            state_manager,
         })
     }
 
@@ -104,12 +107,25 @@ impl RuleEngine {
 
         // Find the first matching rule (rules are sorted by priority)
         for rule in &self.rules {
+            // Check if rule is enabled
+            if !self.state_manager.is_rule_enabled(&rule.name) {
+                debug!("Rule '{}' is disabled, skipping", rule.name);
+                continue;
+            }
+
             if self.matches_rule(header, msg, rule, direction) {
                 info!(
-                    "Rule matched: {} - {}",
-                    rule.message_type,
+                    "Rule matched: '{}' - {}",
+                    rule.name,
                     rule.description.as_deref().unwrap_or("no description")
                 );
+
+                // Execute triggers on_match if configured
+                if let Some(triggers) = &rule.triggers {
+                    if triggers.on_match {
+                        self.execute_triggers(triggers, &rule.name);
+                    }
+                }
 
                 // Execute plugins for this rule
                 self.execute_plugins(rule, header, msg);
@@ -139,6 +155,32 @@ impl RuleEngine {
             if let Err(e) = self.plugin_manager.execute_plugin(plugin_name, &context) {
                 warn!("Plugin '{}' execution failed: {}", plugin_name, e);
             }
+        }
+    }
+
+    /// Execute triggers (activate/deactivate other rules)
+    fn execute_triggers(&self, triggers: &crate::config::TriggerConfig, source_rule: &str) {
+        use std::time::Duration;
+
+        // Activate rules
+        for rule_name in &triggers.activate_rules {
+            if let Some(duration_secs) = triggers.duration_seconds {
+                let duration = Duration::from_secs(duration_secs);
+                self.state_manager.activate_rule(rule_name, duration);
+                info!(
+                    "Rule '{}' activated rule '{}' for {}s",
+                    source_rule, rule_name, duration_secs
+                );
+            }
+        }
+
+        // Deactivate rules
+        for rule_name in &triggers.deactivate_rules {
+            self.state_manager.deactivate_rule(rule_name);
+            info!(
+                "Rule '{}' deactivated rule '{}'",
+                source_rule, rule_name
+            );
         }
     }
 

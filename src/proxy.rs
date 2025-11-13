@@ -43,7 +43,24 @@ impl ProxyServer {
         plugin_manager: PluginManager,
         modifier_manager: ModifierManager,
     ) -> Result<Self> {
-        let rule_engine = RuleEngine::new(config.rules.clone(), plugin_manager, modifier_manager)?;
+        // Initialize rule state manager with default states from config
+        let initial_states: std::collections::HashMap<String, bool> = config
+            .rules
+            .iter()
+            .map(|rule| (rule.name.clone(), rule.enabled_by_default))
+            .collect();
+
+        let state_manager = Arc::new(crate::rule_state::RuleStateManager::new(initial_states));
+
+        // Spawn background task to clean up expired rule activations
+        state_manager.clone().spawn_cleanup_task();
+
+        let rule_engine = RuleEngine::new(
+            config.rules.clone(),
+            plugin_manager,
+            modifier_manager,
+            state_manager,
+        )?;
 
         Ok(Self {
             config: Arc::new(config),
@@ -59,17 +76,19 @@ impl ProxyServer {
         destination: Destination,
         state: Arc<ProxyState>,
     ) {
-        Self::execute_actions_impl(actions, vec![packet], destination, state).await;
+        execute_actions_impl(actions, vec![packet], destination, state).await;
     }
+}
 
-    /// Execute a sequence of actions on multiple packets
-    fn execute_actions_impl(
-        mut actions: Vec<Action>,
-        packets: Vec<Vec<u8>>,
-        destination: Destination,
-        state: Arc<ProxyState>,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        Box::pin(async move {
+/// Execute a sequence of actions on multiple packets
+/// This is a public function that can be called from other modules (e.g., batch timeout handler)
+pub fn execute_actions_impl(
+    mut actions: Vec<Action>,
+    packets: Vec<Vec<u8>>,
+    destination: Destination,
+    state: Arc<ProxyState>,
+) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    Box::pin(async move {
         if actions.is_empty() {
             // No actions, forward all packets
             for packet in packets {
@@ -96,7 +115,7 @@ impl ProxyServer {
         match action {
             Action::Forward => {
                 // Forward and continue with remaining actions
-                Self::execute_actions_impl(remaining_actions, packets, destination, state).await;
+                execute_actions_impl(remaining_actions, packets, destination, state).await;
             }
             Action::Block => {
                 warn!("Message(s) blocked by rule");
@@ -140,7 +159,7 @@ impl ProxyServer {
                     }
 
                     // Continue with remaining actions using modified packets
-                    Self::execute_actions_impl(
+                    execute_actions_impl(
                         remaining_actions,
                         modified_packets,
                         destination,
@@ -149,7 +168,7 @@ impl ProxyServer {
                     .await;
                 } else {
                     warn!("Modify action has no modified message, forwarding original");
-                    Self::execute_actions_impl(remaining_actions, packets, destination, state)
+                    execute_actions_impl(remaining_actions, packets, destination, state)
                         .await;
                 }
             }
@@ -163,7 +182,7 @@ impl ProxyServer {
 
                 tokio::spawn(async move {
                     sleep(duration).await;
-                    Self::execute_actions_impl(remaining_actions, packets, destination, state)
+                    execute_actions_impl(remaining_actions, packets, destination, state)
                         .await;
                     info!("Delayed message(s) forwarded after {}s", delay_secs);
                 });
@@ -186,7 +205,7 @@ impl ProxyServer {
                 let system_id = if let Ok((header, msg)) = parse_mavlink_message(&packet) {
                     if let Some(ref field_name) = system_id_field {
                         // Extract from specified message field
-                        Self::extract_system_id_from_message(&msg, field_name).unwrap_or(header.system_id)
+                        ProxyServer::extract_system_id_from_message(&msg, field_name).unwrap_or(header.system_id)
                     } else {
                         // Default: use header system_id
                         header.system_id
@@ -206,6 +225,7 @@ impl ProxyServer {
                         forward_on_timeout,
                         remaining_actions.clone(),
                         destination.clone(),
+                        state.clone(),
                     )
                     .await;
 
@@ -224,7 +244,7 @@ impl ProxyServer {
                             remaining_actions.len(),
                             packets.len()
                         );
-                        Self::execute_actions_impl(
+                        execute_actions_impl(
                             remaining_actions,
                             packets,
                             destination,
@@ -236,8 +256,9 @@ impl ProxyServer {
             }
         }
         })
-    }
+}
 
+impl ProxyServer {
     /// Extract system_id from a message field generically
     fn extract_system_id_from_message(msg: &MavMessage, field_name: &str) -> Option<u8> {
         // Serialize message to JSON (mavlink internally-tagged format)

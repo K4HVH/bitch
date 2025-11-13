@@ -55,6 +55,14 @@ fn default_direction() -> String {
     "gcs_to_router".to_string()
 }
 
+fn default_enabled() -> bool {
+    true
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct NetworkConfig {
     pub gcs_listen_port: u16,
@@ -92,8 +100,15 @@ pub struct AutoAckConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct CommandRule {
+    /// Unique name for this rule (required for trigger system)
+    pub name: String,
+
     /// The type of MAVLINK message (e.g., "COMMAND_LONG", "MISSION_ITEM")
     pub message_type: String,
+
+    /// Whether this rule is enabled by default (default: true)
+    #[serde(default = "default_enabled")]
+    pub enabled_by_default: bool,
 
     /// Optional: Conditions that must match for this rule to apply
     #[serde(default)]
@@ -157,6 +172,31 @@ pub struct CommandRule {
     /// "gcs_to_router" (default), "router_to_gcs", or "both"
     #[serde(default = "default_direction")]
     pub direction: String,
+
+    /// Optional: Trigger configuration for activating other rules
+    pub triggers: Option<TriggerConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TriggerConfig {
+    /// List of rule names to activate when this rule matches
+    #[serde(default)]
+    pub activate_rules: Vec<String>,
+
+    /// List of rule names to deactivate when this rule matches
+    #[serde(default)]
+    pub deactivate_rules: Vec<String>,
+
+    /// Duration in seconds to keep activated rules active
+    pub duration_seconds: Option<u64>,
+
+    /// Trigger when rule matches (default: true)
+    #[serde(default = "default_true")]
+    pub on_match: bool,
+
+    /// Trigger after all actions complete (default: false)
+    #[serde(default)]
+    pub on_complete: bool,
 }
 
 impl CommandRule {
@@ -271,6 +311,66 @@ impl Config {
                     "Rule {} has auto_ack enabled but no [rules.ack] section specified",
                     idx
                 );
+            }
+
+            // Validate trigger requirements
+            if let Some(triggers) = &rule.triggers {
+                // Must have at least one trigger action
+                if triggers.activate_rules.is_empty() && triggers.deactivate_rules.is_empty() {
+                    anyhow::bail!(
+                        "Rule '{}' has triggers section but no activate_rules or deactivate_rules",
+                        rule.name
+                    );
+                }
+
+                // Must have at least one trigger timing
+                if !triggers.on_match && !triggers.on_complete {
+                    anyhow::bail!(
+                        "Rule '{}' has triggers but neither on_match nor on_complete is true",
+                        rule.name
+                    );
+                }
+
+                // If activating rules, must specify duration
+                if !triggers.activate_rules.is_empty() && triggers.duration_seconds.is_none() {
+                    anyhow::bail!(
+                        "Rule '{}' activates rules but has no duration_seconds specified",
+                        rule.name
+                    );
+                }
+            }
+        }
+
+        // Validate rule names are unique
+        let mut names = std::collections::HashSet::new();
+        for rule in &self.rules {
+            if !names.insert(&rule.name) {
+                anyhow::bail!("Duplicate rule name: '{}'", rule.name);
+            }
+        }
+
+        // Validate triggered rule names exist
+        let rule_names: std::collections::HashSet<_> = self.rules.iter().map(|r| &r.name).collect();
+        for rule in &self.rules {
+            if let Some(triggers) = &rule.triggers {
+                for target_name in &triggers.activate_rules {
+                    if !rule_names.contains(target_name) {
+                        anyhow::bail!(
+                            "Rule '{}' tries to activate non-existent rule '{}'",
+                            rule.name,
+                            target_name
+                        );
+                    }
+                }
+                for target_name in &triggers.deactivate_rules {
+                    if !rule_names.contains(target_name) {
+                        anyhow::bail!(
+                            "Rule '{}' tries to deactivate non-existent rule '{}'",
+                            rule.name,
+                            target_name
+                        );
+                    }
+                }
             }
         }
 
