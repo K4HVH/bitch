@@ -197,6 +197,12 @@ pub struct TriggerConfig {
     /// Trigger after all actions complete (default: false)
     #[serde(default)]
     pub on_complete: bool,
+
+    /// Pass full triggering message context to activated rules
+    /// When true, activated rules receive the complete message and header that triggered them
+    /// Accessible in Lua as ctx.trigger_context
+    #[serde(default)]
+    pub context: bool,
 }
 
 impl CommandRule {

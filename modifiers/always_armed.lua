@@ -1,9 +1,25 @@
 -- Always Armed Modifier
 -- Modifies HEARTBEAT messages to show drones as always armed
 -- Sets the MAV_MODE_FLAG_SAFETY_ARMED bit (128) in base_mode
+-- If activated by trigger, only affects the drone that was targeted by the triggering command
 
 function modify(ctx)
     local msg = ctx.message
+
+    -- Check if activated by trigger with context
+    if ctx.trigger_context and ctx.trigger_context.message then
+        local trigger_msg = ctx.trigger_context.message
+
+        -- Extract target_system from triggering command (e.g., ARM command)
+        if trigger_msg.target_system then
+            local target_system = trigger_msg.target_system
+            -- Only modify HEARTBEATs from the drone that was targeted
+            if ctx.system_id ~= target_system then
+                -- This HEARTBEAT is not from the target drone, skip modification
+                return ctx
+            end
+        end
+    end
 
     -- Messages use mavlink internally-tagged format: {type = "MESSAGE_TYPE", field1 = ..., field2 = ...}
     if msg.type == "HEARTBEAT" then

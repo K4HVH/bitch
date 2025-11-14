@@ -123,7 +123,7 @@ impl RuleEngine {
                 // Execute triggers on_match if configured
                 if let Some(triggers) = &rule.triggers {
                     if triggers.on_match {
-                        self.execute_triggers(triggers, &rule.name);
+                        self.execute_triggers(triggers, &rule.name, header, msg);
                     }
                 }
 
@@ -147,8 +147,8 @@ impl RuleEngine {
             return;
         }
 
-        // Build context for plugins
-        let context = self.build_plugin_context(header, msg);
+        // Build context for plugins (includes trigger_context if rule was activated by trigger)
+        let context = self.build_plugin_context(header, msg, &rule.name);
 
         // Execute each plugin
         for plugin_name in &rule.plugins {
@@ -159,44 +159,63 @@ impl RuleEngine {
     }
 
     /// Execute triggers (activate/deactivate other rules)
-    fn execute_triggers(&self, triggers: &crate::config::TriggerConfig, source_rule: &str) {
+    fn execute_triggers(&self, triggers: &crate::config::TriggerConfig, source_rule: &str, header: &MavHeader, msg: &MavMessage) {
         use std::time::Duration;
+        use std::collections::HashMap;
+        use serde_json::Value as JsonValue;
 
-        // Activate rules
+        // Build full context with triggering message and header if configured
+        let context: HashMap<String, JsonValue> = if triggers.context {
+            let mut ctx = HashMap::new();
+
+            // Add header data
+            ctx.insert("system_id".to_string(), JsonValue::from(header.system_id));
+            ctx.insert("component_id".to_string(), JsonValue::from(header.component_id));
+            ctx.insert("sequence".to_string(), JsonValue::from(header.sequence));
+
+            // Add full message
+            if let Ok(message_json) = serde_json::to_value(msg) {
+                ctx.insert("message".to_string(), message_json);
+            }
+
+            ctx
+        } else {
+            HashMap::new()
+        };
+
+        // Activate rules with optional context
         for rule_name in &triggers.activate_rules {
             if let Some(duration_secs) = triggers.duration_seconds {
                 let duration = Duration::from_secs(duration_secs);
-                self.state_manager.activate_rule(rule_name, duration);
-                info!(
-                    "Rule '{}' activated rule '{}' for {}s",
-                    source_rule, rule_name, duration_secs
-                );
+                self.state_manager.activate_rule(rule_name, duration, context.clone());
+                info!("Rule '{}' activated rule '{}' for {}s", source_rule, rule_name, duration_secs);
             }
         }
 
         // Deactivate rules
         for rule_name in &triggers.deactivate_rules {
             self.state_manager.deactivate_rule(rule_name);
-            info!(
-                "Rule '{}' deactivated rule '{}'",
-                source_rule, rule_name
-            );
+            info!("Rule '{}' deactivated rule '{}'", source_rule, rule_name);
         }
     }
 
     /// Build plugin context from MAVLINK message (works for all message types)
-    fn build_plugin_context(&self, header: &MavHeader, msg: &MavMessage) -> PluginContext {
+    fn build_plugin_context(&self, header: &MavHeader, msg: &MavMessage, rule_name: &str) -> PluginContext {
         let message_type = get_message_name(msg);
 
         // Serialize message to JSON (mavlink internally-tagged format)
         let message_json = serde_json::to_value(msg)
             .unwrap_or_else(|_| serde_json::json!({}));
 
+        // Get trigger context for this rule (if activated by trigger)
+        let trigger_context = self.state_manager.get_trigger_context(rule_name);
+
         PluginContext {
             system_id: header.system_id,
             component_id: header.component_id,
             message_type,
             message: message_json,
+            trigger_context,
         }
     }
 
@@ -347,8 +366,11 @@ impl RuleEngine {
                 "forward" => Action::Forward,
                 "modify" => {
                     if let Some(ref modifier_name) = rule.modifier {
-                        // Execute the modifier with the full message
-                        match self.modifier_manager.execute_modifier(modifier_name, header, msg) {
+                        // Get trigger context for this rule (if activated by trigger)
+                        let trigger_context = self.state_manager.get_trigger_context(&rule.name);
+
+                        // Execute the modifier with the full message and trigger context
+                        match self.modifier_manager.execute_modifier(modifier_name, header, msg, &trigger_context) {
                             Ok(modified_msg) => {
                                 Action::Modify {
                                     modifier: modifier_name.clone(),

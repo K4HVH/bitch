@@ -7,6 +7,7 @@ use anyhow::Result;
 use mlua::Lua;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 
 /// Context passed to plugins when a rule matches
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,6 +20,9 @@ pub struct PluginContext {
     pub message_type: String,
     /// Full message data (works for ALL message types)
     pub message: JsonValue,
+    /// Trigger context data (if rule was activated by a trigger)
+    #[serde(default)]
+    pub trigger_context: HashMap<String, JsonValue>,
 }
 
 /// Initialize all Lua APIs

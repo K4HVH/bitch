@@ -68,20 +68,10 @@ impl ProxyServer {
             state: Arc::new(ProxyState::new()),
         })
     }
-
-    /// Execute a sequence of actions on a packet
-    async fn execute_actions(
-        actions: Vec<Action>,
-        packet: Vec<u8>,
-        destination: Destination,
-        state: Arc<ProxyState>,
-    ) {
-        execute_actions_impl(actions, vec![packet], destination, state).await;
-    }
 }
 
 /// Execute a sequence of actions on multiple packets
-/// This is a public function that can be called from other modules (e.g., batch timeout handler)
+/// Called from message handlers and batch timeout handlers
 pub fn execute_actions_impl(
     mut actions: Vec<Action>,
     packets: Vec<Vec<u8>>,
@@ -479,9 +469,9 @@ impl ProxyServer {
                     }
 
                     // Execute action sequence
-                    Self::execute_actions(
+                    execute_actions_impl(
                         result.actions,
-                        packet.to_vec(),
+                        vec![packet.to_vec()],
                         Destination::Router(router_socket.clone()),
                         state.clone(),
                     )
@@ -548,9 +538,9 @@ impl ProxyServer {
                         }
 
                         // Execute action sequence (router->GCS direction)
-                        Self::execute_actions(
+                        execute_actions_impl(
                             result.actions,
-                            packet.to_vec(),
+                            vec![packet.to_vec()],
                             Destination::Gcs(gcs_socket.clone(), addr),
                             state.clone(),
                         )

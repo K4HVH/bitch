@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
+use serde_json::Value as JsonValue;
 
 /// Manager for loading and executing Lua modifier scripts
 pub struct ModifierManager {
@@ -87,6 +88,7 @@ impl ModifierManager {
         name: &str,
         header: &MavHeader,
         msg: &MavMessage,
+        trigger_context: &HashMap<String, JsonValue>,
     ) -> Result<MavMessage> {
         let code = self
             .modifiers
@@ -122,6 +124,14 @@ impl ModifierManager {
 
         context_table.set("message", msg_value)
             .map_err(|e| anyhow::anyhow!("Failed to set message: {}", e))?;
+
+        // Add trigger_context if present
+        if !trigger_context.is_empty() {
+            let trigger_ctx_value = self.lua.to_value(trigger_context)
+                .map_err(|e| anyhow::anyhow!("Failed to serialize trigger_context to Lua: {}", e))?;
+            context_table.set("trigger_context", trigger_ctx_value)
+                .map_err(|e| anyhow::anyhow!("Failed to set trigger_context: {}", e))?;
+        }
 
         globals.set("context", context_table)
             .map_err(|e| anyhow::anyhow!("Failed to set context global: {}", e))?;
