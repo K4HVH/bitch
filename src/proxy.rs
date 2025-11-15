@@ -6,8 +6,10 @@ use crate::rules::{parse_mavlink_message, Action, AckInfo, ProcessResult, RuleEn
 use anyhow::{Context, Result};
 use mavlink::ardupilotmega::MavMessage;
 use mavlink::{MavHeader, MavlinkVersion};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -15,15 +17,58 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
+/// Unique identifier for each GCS client
+type ClientId = u64;
+
 /// Shared state for the proxy
 pub struct ProxyState {
     batch_manager: BatchManager,
+    /// Connected GCS clients (ClientId -> WriteHalf)
+    gcs_clients: RwLock<HashMap<ClientId, Arc<RwLock<tokio::net::tcp::OwnedWriteHalf>>>>,
+    /// Counter for generating unique client IDs
+    next_client_id: AtomicU64,
 }
 
 impl ProxyState {
     pub fn new() -> Self {
         Self {
             batch_manager: BatchManager::new(),
+            gcs_clients: RwLock::new(HashMap::new()),
+            next_client_id: AtomicU64::new(1),
+        }
+    }
+
+    /// Add a new GCS client and return its ID
+    pub async fn add_gcs_client(&self, writer: tokio::net::tcp::OwnedWriteHalf) -> ClientId {
+        let client_id = self.next_client_id.fetch_add(1, Ordering::SeqCst);
+        let mut clients = self.gcs_clients.write().await;
+        clients.insert(client_id, Arc::new(RwLock::new(writer)));
+        info!("GCS client {} connected (total: {})", client_id, clients.len());
+        client_id
+    }
+
+    /// Remove a GCS client
+    pub async fn remove_gcs_client(&self, client_id: ClientId) {
+        let mut clients = self.gcs_clients.write().await;
+        clients.remove(&client_id);
+        info!("GCS client {} disconnected (remaining: {})", client_id, clients.len());
+    }
+
+    /// Get a clone of a specific GCS client writer
+    pub async fn get_gcs_client(&self, client_id: ClientId) -> Option<Arc<RwLock<tokio::net::tcp::OwnedWriteHalf>>> {
+        let clients = self.gcs_clients.read().await;
+        clients.get(&client_id).cloned()
+    }
+
+    /// Broadcast a packet to all connected GCS clients
+    pub async fn broadcast_to_all_gcs(&self, packet: &[u8]) {
+        let clients = self.gcs_clients.read().await;
+
+        for (client_id, writer) in clients.iter() {
+            let mut stream = writer.write().await;
+            if let Err(e) = stream.write_all(packet).await {
+                error!("Failed to send to GCS client {}: {}", client_id, e);
+            }
         }
     }
 }
@@ -110,6 +155,85 @@ impl ProxyServer {
     }
 }
 
+/// Execute actions and broadcast result to all GCS clients
+pub fn execute_actions_impl_broadcast(
+    mut actions: Vec<Action>,
+    packets: Vec<Vec<u8>>,
+    state: Arc<ProxyState>,
+) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        if actions.is_empty() {
+            // No actions, broadcast all packets
+            for packet in packets {
+                state.broadcast_to_all_gcs(&packet).await;
+            }
+            return;
+        }
+
+        // Take first action and process
+        let action = actions.remove(0);
+        let remaining_actions = actions;
+
+        match action {
+            Action::Forward => {
+                // Forward and continue with remaining actions
+                execute_actions_impl_broadcast(remaining_actions, packets, state).await;
+            }
+            Action::Block => {
+                warn!("Message(s) blocked by rule (broadcast direction)");
+            }
+            Action::Modify {
+                modifier,
+                modified_message,
+            } => {
+                if let Some(modified_msg) = modified_message {
+                    info!("Applying modification from '{}' (Router->GCS broadcast)", modifier);
+
+                    let mut modified_packets = Vec::new();
+                    for packet in packets {
+                        if let Ok((header, _original_msg)) = parse_mavlink_message(&packet) {
+                            let mut buf = Vec::new();
+                            if let Err(e) = mavlink::write_versioned_msg(
+                                &mut buf,
+                                MavlinkVersion::V2,
+                                header,
+                                &modified_msg,
+                            ) {
+                                error!("Failed to serialize modified message: {}", e);
+                                modified_packets.push(packet);
+                            } else {
+                                modified_packets.push(buf);
+                            }
+                        } else {
+                            warn!("Failed to parse packet for modification, using original");
+                            modified_packets.push(packet);
+                        }
+                    }
+
+                    execute_actions_impl_broadcast(remaining_actions, modified_packets, state).await;
+                } else {
+                    warn!("Modify action has no modified message, forwarding original");
+                    execute_actions_impl_broadcast(remaining_actions, packets, state).await;
+                }
+            }
+            Action::Delay(duration) => {
+                let delay_secs = duration.as_secs();
+                info!("Message(s) queued for {}s delay (broadcast)", delay_secs);
+
+                tokio::spawn(async move {
+                    sleep(duration).await;
+                    execute_actions_impl_broadcast(remaining_actions, packets, state).await;
+                    info!("Delayed broadcast message(s) forwarded after {}s", delay_secs);
+                });
+            }
+            Action::Batch { .. } => {
+                warn!("Batch action not supported in router->GCS direction, forwarding");
+                execute_actions_impl_broadcast(remaining_actions, packets, state).await;
+            }
+        }
+    })
+}
+
 /// Execute a sequence of actions on multiple packets
 /// Called from message handlers and batch timeout handlers
 pub fn execute_actions_impl(
@@ -122,19 +246,10 @@ pub fn execute_actions_impl(
         if actions.is_empty() {
             // No actions, forward all packets
             for packet in packets {
-                match &destination {
-                    Destination::Router(writer) => {
-                        let mut stream = writer.write().await;
-                        if let Err(e) = stream.write_all(&packet).await {
-                            error!("Failed to forward packet to router: {}", e);
-                        }
-                    }
-                    Destination::Gcs(writer) => {
-                        let mut stream = writer.write().await;
-                        if let Err(e) = stream.write_all(&packet).await {
-                            error!("Failed to forward packet to GCS: {}", e);
-                        }
-                    }
+                let Destination::Router(writer) = &destination;
+                let mut stream = writer.write().await;
+                if let Err(e) = stream.write_all(&packet).await {
+                    error!("Failed to forward packet to router: {}", e);
                 }
             }
             return;
@@ -159,11 +274,7 @@ pub fn execute_actions_impl(
             } => {
                 // Modify action: replace message content with modified version
                 if let Some(modified_msg) = modified_message {
-                    let direction_label = match &destination {
-                        Destination::Router(_) => "GCS->Router",
-                        Destination::Gcs(_) => "Router->GCS",
-                    };
-                    info!("Applying modification from '{}' ({})", modifier, direction_label);
+                    info!("Applying modification from '{}' (GCS->Router)", modifier);
 
                     // Reconstruct packet with modified message
                     let mut modified_packets = Vec::new();
@@ -388,22 +499,7 @@ impl ProxyServer {
             );
         }
 
-        // Bind TCP listener for GCS connections
-        let gcs_listener = TcpListener::bind(format!(
-            "{}:{}",
-            self.config.network.gcs_listen_address, self.config.network.gcs_listen_port
-        ))
-        .await
-        .context("Failed to bind GCS TCP listener")?;
-
-        info!("TCP listener initialized");
-
-        // Accept GCS connection
-        info!("Waiting for GCS connection...");
-        let (gcs_stream, gcs_addr) = gcs_listener.accept().await.context("Failed to accept GCS connection")?;
-        info!("GCS connected from: {}", gcs_addr);
-
-        // Connect to mavlink-router
+        // Connect to mavlink-router first (single persistent connection)
         let router_addr = format!(
             "{}:{}",
             self.config.network.router_address, self.config.network.router_port
@@ -413,71 +509,113 @@ impl ProxyServer {
             .context("Failed to connect to mavlink-router")?;
         info!("Connected to mavlink-router at {}", router_addr);
 
-        // Split streams for concurrent reading/writing
-        let (gcs_read, gcs_write) = gcs_stream.into_split();
+        // Split router stream
         let (router_read, router_write) = router_stream.into_split();
-
-        let gcs_write = Arc::new(RwLock::new(gcs_write));
         let router_write = Arc::new(RwLock::new(router_write));
 
-        // Spawn GCS -> Router forwarding task
-        let gcs_to_router_task = {
-            let router_write = router_write.clone();
-            let gcs_write = gcs_write.clone();
+        // Bind TCP listener for GCS connections
+        let gcs_listener = TcpListener::bind(format!(
+            "{}:{}",
+            self.config.network.gcs_listen_address, self.config.network.gcs_listen_port
+        ))
+        .await
+        .context("Failed to bind GCS TCP listener")?;
+
+        info!("TCP listener initialized, accepting multiple GCS connections...");
+
+        // Spawn Router -> All GCS broadcast task
+        let router_to_all_gcs_task = {
             let state = self.state.clone();
             let rule_engine = self.rule_engine.clone();
+            let router_write = router_write.clone();
 
             tokio::spawn(async move {
-                Self::forward_gcs_to_router(gcs_read, router_write, gcs_write, state, rule_engine).await
+                Self::forward_router_to_all_gcs(router_read, router_write, state, rule_engine).await
             })
         };
 
-        // Spawn Router -> GCS forwarding task
-        let router_to_gcs_task = {
-            let gcs_write = gcs_write.clone();
-            let router_write = router_write.clone();
+        // Accept GCS connections in a loop
+        let gcs_accept_task = {
             let state = self.state.clone();
             let rule_engine = self.rule_engine.clone();
+            let router_write = router_write.clone();
 
             tokio::spawn(async move {
-                Self::forward_router_to_gcs(router_read, gcs_write, router_write, state, rule_engine).await
+                loop {
+                    match gcs_listener.accept().await {
+                        Ok((gcs_stream, gcs_addr)) => {
+                            info!("New GCS connection from: {}", gcs_addr);
+
+                            // Split the GCS stream
+                            let (gcs_read, gcs_write) = gcs_stream.into_split();
+
+                            // Register the client
+                            let client_id = state.add_gcs_client(gcs_write).await;
+
+                            // Spawn task to handle this GCS client (GCS -> Router)
+                            let state_clone = state.clone();
+                            let rule_engine_clone = rule_engine.clone();
+                            let router_write_clone = router_write.clone();
+
+                            tokio::spawn(async move {
+                                if let Err(e) = Self::forward_gcs_to_router(
+                                    client_id,
+                                    gcs_read,
+                                    router_write_clone,
+                                    state_clone.clone(),
+                                    rule_engine_clone,
+                                )
+                                .await
+                                {
+                                    error!("GCS client {} error: {}", client_id, e);
+                                }
+
+                                // Remove client on disconnect
+                                state_clone.remove_gcs_client(client_id).await;
+                            });
+                        }
+                        Err(e) => {
+                            error!("Failed to accept GCS connection: {}", e);
+                        }
+                    }
+                }
             })
         };
 
-        // Wait for both tasks
+        // Wait for tasks (router broadcast task should never end normally)
         tokio::select! {
-            result = gcs_to_router_task => {
-                error!("GCS->Router task ended: {:?}", result);
+            result = router_to_all_gcs_task => {
+                error!("Router->GCS broadcast task ended: {:?}", result);
             }
-            result = router_to_gcs_task => {
-                error!("Router->GCS task ended: {:?}", result);
+            result = gcs_accept_task => {
+                error!("GCS accept task ended: {:?}", result);
             }
         }
 
         Ok(())
     }
 
-    /// Forward messages from GCS to Router with rule processing
+    /// Forward messages from a specific GCS client to Router with rule processing
     async fn forward_gcs_to_router(
+        client_id: ClientId,
         mut gcs_read: tokio::net::tcp::OwnedReadHalf,
         router_write: Arc<RwLock<tokio::net::tcp::OwnedWriteHalf>>,
-        gcs_write: Arc<RwLock<tokio::net::tcp::OwnedWriteHalf>>,
         state: Arc<ProxyState>,
         rule_engine: Arc<RuleEngine>,
     ) -> Result<()> {
-        info!("GCS->Router forwarding started");
+        info!("GCS client {} -> Router forwarding started", client_id);
 
         loop {
-            // Read MAVLink packet from GCS
+            // Read MAVLink packet from this GCS client
             let packet = match read_mavlink_packet(&mut gcs_read).await {
                 Ok(pkt) => pkt,
                 Err(e) => {
-                    error!("Error reading from GCS: {}", e);
+                    debug!("GCS client {} read error: {}", client_id, e);
                     break;
                 }
             };
 
-            debug!("GCS->Router: {} bytes", packet.len());
+            debug!("GCS client {} -> Router: {} bytes", client_id, packet.len());
 
             // Try to parse and process the MAVLink message
             let result = if let Ok((header, msg)) = parse_mavlink_message(&packet) {
@@ -491,18 +629,20 @@ impl ProxyServer {
                 }
             };
 
-            // Send ACK if auto_ack is enabled (works for ANY message type)
+            // Send ACK if auto_ack is enabled (to this specific GCS client)
             if let Some(ref ack_info) = result.ack_info {
                 match Self::build_ack(ack_info) {
                     Ok(ack_packet) => {
-                        let mut writer = gcs_write.write().await;
-                        if let Err(e) = writer.write_all(&ack_packet).await {
-                            error!("Failed to send {} to GCS: {}", ack_info.message_type, e);
-                        } else {
-                            info!(
-                                "Sent {} to GCS (sysid={})",
-                                ack_info.message_type, ack_info.source_system
-                            );
+                        if let Some(gcs_writer) = state.get_gcs_client(client_id).await {
+                            let mut writer = gcs_writer.write().await;
+                            if let Err(e) = writer.write_all(&ack_packet).await {
+                                error!("Failed to send {} to GCS client {}: {}", ack_info.message_type, client_id, e);
+                            } else {
+                                info!(
+                                    "Sent {} to GCS client {} (sysid={})",
+                                    ack_info.message_type, client_id, ack_info.source_system
+                                );
+                            }
                         }
                     }
                     Err(e) => {
@@ -521,18 +661,18 @@ impl ProxyServer {
             .await;
         }
 
+        info!("GCS client {} -> Router forwarding ended", client_id);
         Ok(())
     }
 
-    /// Forward messages from Router to GCS
-    async fn forward_router_to_gcs(
+    /// Forward messages from Router to all connected GCS clients (broadcast)
+    async fn forward_router_to_all_gcs(
         mut router_read: tokio::net::tcp::OwnedReadHalf,
-        gcs_write: Arc<RwLock<tokio::net::tcp::OwnedWriteHalf>>,
         router_write: Arc<RwLock<tokio::net::tcp::OwnedWriteHalf>>,
         state: Arc<ProxyState>,
         rule_engine: Arc<RuleEngine>,
     ) -> Result<()> {
-        info!("Router->GCS forwarding started");
+        info!("Router -> All GCS broadcast started");
 
         loop {
             // Read MAVLink packet from Router
@@ -544,7 +684,7 @@ impl ProxyServer {
                 }
             };
 
-            debug!("Router->GCS: {} bytes", packet.len());
+            debug!("Router -> All GCS: {} bytes", packet.len());
 
             // Try to parse and process the MAVLink message
             let result = if let Ok((header, msg)) = parse_mavlink_message(&packet) {
@@ -558,7 +698,7 @@ impl ProxyServer {
                 }
             };
 
-            // Send ACK if auto_ack is enabled (works for ANY message type)
+            // Send ACK if auto_ack is enabled (back to router)
             if let Some(ref ack_info) = result.ack_info {
                 match Self::build_ack(ack_info) {
                     Ok(ack_packet) => {
@@ -578,14 +718,21 @@ impl ProxyServer {
                 }
             }
 
-            // Execute action sequence (router->GCS direction)
-            execute_actions_impl(
-                result.actions,
-                vec![packet],
-                Destination::Gcs(gcs_write.clone()),
-                state.clone(),
-            )
-            .await;
+            // Process actions and broadcast to all GCS clients
+            // Note: For broadcast, we handle it specially since we need to send to multiple clients
+            if result.actions.is_empty() || matches!(result.actions.first(), Some(Action::Forward)) {
+                // Simple forward - just broadcast the packet
+                state.broadcast_to_all_gcs(&packet).await;
+            } else {
+                // Complex actions (modify, delay, etc.) - process then broadcast
+                // We'll create a custom destination that broadcasts
+                execute_actions_impl_broadcast(
+                    result.actions,
+                    vec![packet],
+                    state.clone(),
+                )
+                .await;
+            }
         }
 
         Ok(())

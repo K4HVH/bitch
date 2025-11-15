@@ -11,8 +11,6 @@ use tracing::{debug, info, warn};
 pub enum Destination {
     /// Send to Router (TCP stream write half)
     Router(Arc<RwLock<tokio::net::tcp::OwnedWriteHalf>>),
-    /// Send to GCS (TCP stream write half)
-    Gcs(Arc<RwLock<tokio::net::tcp::OwnedWriteHalf>>),
 }
 
 /// Result of queuing a message to a batch
