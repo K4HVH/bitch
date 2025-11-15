@@ -17,8 +17,12 @@ cargo build --release
 ## Architecture
 
 ```
-Mission Planner <--> BITCH :14550 <--> mavlink-router :14551 <--> Drones
+QGC             ┐
+Mission Planner ├─→ BITCH :5760 (TCP) ←→ mavlink-router :5761 (TCP) ←→ Drones
+Other GCS       ┘
 ```
+
+**Multi-Client Support**: BITCH accepts unlimited simultaneous GCS connections on port 5760. All clients receive identical telemetry (broadcast), and commands from any client are processed through the rule engine.
 
 ## Configuration
 
@@ -37,15 +41,18 @@ See `DOCUMENTATION.md` for complete documentation including:
 
 ## Features
 
-- Bidirectional UDP proxy (GCS ↔ Router)
+- **Multi-client TCP proxy** - Unlimited simultaneous GCS connections
+- Bidirectional TCP forwarding (GCS ↔ Router)
+- **Broadcast telemetry** - All GCS clients receive identical data
 - Rule-based message filtering with priorities
 - **Trigger system** - Dynamic rule activation/deactivation
 - Actions: forward, block, modify, delay, batch (with command chaining)
 - Direction control: gcs_to_router, router_to_gcs, both
 - Auto-ACK system (generic for all message types)
 - Lua scripting for modifiers and plugins
-- Batch synchronization across multiple drones
+- **Cross-client batch synchronization** - Commands from different GCS apps contribute to same batch
 - Async/non-blocking operation
+- Graceful client connect/disconnect handling
 
 ## License
 
