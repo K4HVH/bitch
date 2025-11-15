@@ -2,10 +2,10 @@
 # See DOCUMENTATION.md for complete documentation
 
 [network]
-gcs_listen_port = 14550
+gcs_listen_port = 5760
 gcs_listen_address = "0.0.0.0"
 router_address = "127.0.0.1"
-router_port = 14551
+router_port = 5761
 
 [logging]
 level = "info"  # trace, debug, info, warn, error
