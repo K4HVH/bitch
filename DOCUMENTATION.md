@@ -25,13 +25,23 @@ A powerful MAVLink proxy that intercepts and transforms messages between Ground 
 ## Architecture
 
 ```
-Mission Planner (GCS) <--> BITCH <--> mavlink-router <--> Drones
-                      :14550            :14551
+QGC (GCS)             ┐
+Mission Planner (GCS) ├─→ BITCH :5760 (TCP) ←→ mavlink-router :5761 (TCP) ←→ Drones
+Other GCS Apps        ┘
 ```
 
-BITCH acts as a transparent bidirectional UDP proxy, parsing MAVLink messages and applying rules to:
-- **GCS → Router**: Full rule processing with all actions
-- **Router → GCS**: Full rule processing with all actions
+BITCH acts as a **multi-client TCP proxy**, parsing MAVLink messages and applying rules to:
+- **GCS → Router**: Full rule processing with all actions (commands from any client)
+- **Router → GCS**: Full rule processing with all actions (broadcast to all clients)
+
+### Multi-Client Architecture
+
+- **Unlimited GCS connections**: Multiple operators can connect simultaneously to port 5760
+- **Broadcast telemetry**: All connected GCS clients receive identical telemetry streams
+- **Command multiplexing**: Commands from any GCS client are processed and forwarded
+- **Cross-client batching**: Batch actions work across all clients (e.g., ARM from different GCS apps contributes to same batch)
+- **Independent connections**: Client disconnects don't affect other clients
+- **Per-client ACKs**: Auto-ACK responses sent only to the originating client
 
 Both directions support all actions: forward, block, modify, delay, and batch.
 
@@ -39,8 +49,10 @@ Both directions support all actions: forward, block, modify, delay, and batch.
 
 ## Features
 
-- **Transparent bidirectional UDP proxy** between GCS and mavlink-router
-- **MAVLink message parsing** (supports both v1 and v2)
+- **Multi-client TCP proxy** - Unlimited simultaneous GCS connections
+- **Broadcast telemetry** - All GCS clients receive identical data streams
+- **Transparent bidirectional forwarding** between multiple GCS and mavlink-router
+- **MAVLink message parsing** (supports both v1 and v2 over TCP)
 - **Rule-based filtering system** with conditions, priorities, and direction control
 - **Trigger system** - Rules can activate/deactivate other rules dynamically
 - **Flexible actions**: delay, block, forward, modify, batch
@@ -49,11 +61,12 @@ Both directions support all actions: forward, block, modify, delay, and batch.
 - **Priority-based rule processing** for complex logic
 - **Direction control**: Apply rules to GCS→Router, Router→GCS, or both
 - **Lua scripting** for modifiers and plugins (unified API)
-- **Batch synchronization** across multiple drones with configurable field extraction
+- **Cross-client batch synchronization** - Commands from different GCS apps contribute to same batch
 - **Generic Auto-ACK** for ANY message type (not just COMMAND_LONG)
 - **Command chaining** - Actions execute sequentially through the entire chain
 - **Async/non-blocking operation** using Tokio
-- **Detailed logging** with tracing
+- **Graceful client management** - Handle connects/disconnects seamlessly
+- **Detailed logging** with tracing and per-client identification
 
 ---
 
@@ -76,13 +89,20 @@ Or directly:
 ./target/release/bitch
 ```
 
-### Configure Mission Planner
+### Configure GCS Applications
+
+**Any GCS application** (QGroundControl, Mission Planner, etc.):
 1. Go to connection settings
-2. Set UDP connection to: `127.0.0.1:14550` (or your machine's IP if remote)
+2. Set **TCP connection** to: `127.0.0.1:5760` (or your machine's IP if remote)
 3. Connect
 
+**Multiple simultaneous connections**:
+- Each GCS can connect independently to port 5760
+- All will receive the same telemetry
+- Commands from any GCS are processed through rules
+
 ### Prerequisites
-- mavlink-router running on port 14551 (configured at `/etc/mavlink-router/main.conf`)
+- mavlink-router running on TCP port 5761 (configured at `/etc/mavlink-router/main.conf`)
 - Rust toolchain for building
 
 ---
@@ -94,10 +114,10 @@ Configuration is managed via `config.toml` with the following sections:
 ### Network Configuration
 ```toml
 [network]
-gcs_listen_port = 14550        # Port for GCS connections
+gcs_listen_port = 5760         # TCP port for GCS connections (accepts multiple clients)
 gcs_listen_address = "0.0.0.0" # Listen on all interfaces
 router_address = "127.0.0.1"   # mavlink-router address
-router_port = 14551            # mavlink-router port
+router_port = 5761             # mavlink-router TCP port
 ```
 
 ### Logging Configuration
@@ -233,6 +253,39 @@ batch_system_id_field = "target_system"  # Batch by who receives the command
 ```toml
 # No batch_system_id_field = uses header.system_id (who sent the message)
 ```
+
+**Multi-Client Batching (Cross-Client Synchronization):**
+
+Batches work **across all connected GCS clients**. This enables coordinated swarm operations from multiple operators:
+
+**Example Scenario:**
+```
+Operator A (QGC)         → ARM drone 1  ┐
+Operator B (Mission Planner) → ARM drone 2  ├→ Batch threshold met! → Release both
+```
+
+- **Shared batch state**: All GCS clients contribute to the same batch
+- **Same batch key**: Commands with matching `batch_key` are grouped together
+- **Cross-operator sync**: Different operators' commands can satisfy batch threshold
+- **Perfect for swarms**: Multiple operators controlling different drones synchronize actions
+
+**Example Configuration:**
+```toml
+[[rules]]
+name = "multi_operator_arm"
+message_type = "COMMAND_LONG"
+actions = ["batch", "delay"]
+batch_count = 2                    # Wait for 2 drones (from any GCS client)
+batch_key = "arm_swarm"
+batch_system_id_field = "target_system"
+delay_seconds = 5
+
+[rules.conditions]
+command = { type = "MAV_CMD_COMPONENT_ARM_DISARM" }
+param1 = 1.0
+```
+
+When Operator A arms drone 1 and Operator B arms drone 2, both commands are batched together and released simultaneously after the 5-second delay.
 
 ### Auto-ACK Feature (COMPLETELY GENERIC)
 
@@ -1303,6 +1356,32 @@ strip target/release/bitch
 - Check timeout duration
 - Look for "Batch timeout" warnings
 - Ensure unique system IDs are being tracked (not total packet count)
+- **Multi-client batching**: Remember that batches work across ALL GCS clients - check if commands are coming from expected clients
+
+### Multi-Client Connection Issues
+
+**GCS Not Connecting:**
+- Verify using **TCP** (not UDP) connection in GCS settings
+- Check port is **5760** (updated from 14550)
+- Ensure BITCH is running and listening: look for "TCP listener initialized" log
+- Try `telnet localhost 5760` to test basic connectivity
+
+**Multiple Clients Not Working:**
+- Each client should see "GCS client X connected" in logs
+- Check client count in connection messages: "total: N"
+- Verify all clients receive telemetry (should be identical)
+- Commands from any client should appear in logs with client ID
+
+**Client Disconnect Issues:**
+- Disconnects should log: "GCS client X disconnected (remaining: N)"
+- Other clients should be unaffected
+- Reconnecting client will get a new ID
+
+**Batch Commands Across Clients:**
+- Commands from different clients contribute to same batch
+- Check logs for batch progress: "Batch 'X': added sysid=Y, now Z/N unique systems"
+- Verify `batch_key` is the same for rules meant to batch together
+- Each client's command should increment unique system count
 
 ### Performance Issues
 
