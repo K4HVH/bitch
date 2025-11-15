@@ -7,30 +7,70 @@ use anyhow::{Context, Result};
 use mavlink::ardupilotmega::MavMessage;
 use mavlink::{MavHeader, MavlinkVersion};
 use std::future::Future;
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 /// Shared state for the proxy
 pub struct ProxyState {
-    gcs_addr: RwLock<Option<SocketAddr>>,
     batch_manager: BatchManager,
 }
 
 impl ProxyState {
     pub fn new() -> Self {
         Self {
-            gcs_addr: RwLock::new(None),
             batch_manager: BatchManager::new(),
         }
     }
 }
 
-/// Main proxy server that handles bidirectional UDP forwarding
+/// Read a single MAVLink packet from an async reader
+async fn read_mavlink_packet<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
+    // MAVLink v2 magic byte
+    const MAVLINK_V2_MAGIC: u8 = 0xFD;
+
+    // Read until we find a magic byte
+    let magic = loop {
+        let mut byte = [0u8; 1];
+        reader.read_exact(&mut byte).await.context("Failed to read magic byte")?;
+        if byte[0] == MAVLINK_V2_MAGIC {
+            break byte[0];
+        }
+    };
+
+    // Read payload length and incompatibility flags
+    let mut header_buf = [0u8; 2];
+    reader.read_exact(&mut header_buf).await.context("Failed to read header")?;
+    let payload_len = header_buf[0] as usize;
+
+    // Read rest of header (7 more bytes after magic, len, incompat)
+    let mut rest_header = [0u8; 7];
+    reader.read_exact(&mut rest_header).await.context("Failed to read rest of header")?;
+
+    // Read payload
+    let mut payload = vec![0u8; payload_len];
+    reader.read_exact(&mut payload).await.context("Failed to read payload")?;
+
+    // Read checksum (2 bytes)
+    let mut checksum = [0u8; 2];
+    reader.read_exact(&mut checksum).await.context("Failed to read checksum")?;
+
+    // Reconstruct complete packet
+    let mut packet = Vec::with_capacity(10 + payload_len + 2);
+    packet.push(magic);
+    packet.extend_from_slice(&header_buf);
+    packet.extend_from_slice(&rest_header);
+    packet.extend_from_slice(&payload);
+    packet.extend_from_slice(&checksum);
+
+    Ok(packet)
+}
+
+/// Main proxy server that handles bidirectional TCP forwarding
 pub struct ProxyServer {
     config: Arc<Config>,
     rule_engine: Arc<RuleEngine>,
@@ -83,13 +123,15 @@ pub fn execute_actions_impl(
             // No actions, forward all packets
             for packet in packets {
                 match &destination {
-                    Destination::Router(socket) => {
-                        if let Err(e) = socket.send(&packet).await {
+                    Destination::Router(writer) => {
+                        let mut stream = writer.write().await;
+                        if let Err(e) = stream.write_all(&packet).await {
                             error!("Failed to forward packet to router: {}", e);
                         }
                     }
-                    Destination::Gcs(socket, addr) => {
-                        if let Err(e) = socket.send_to(&packet, addr).await {
+                    Destination::Gcs(writer) => {
+                        let mut stream = writer.write().await;
+                        if let Err(e) = stream.write_all(&packet).await {
                             error!("Failed to forward packet to GCS: {}", e);
                         }
                     }
@@ -119,7 +161,7 @@ pub fn execute_actions_impl(
                 if let Some(modified_msg) = modified_message {
                     let direction_label = match &destination {
                         Destination::Router(_) => "GCS->Router",
-                        Destination::Gcs(_, _) => "Router->GCS",
+                        Destination::Gcs(_) => "Router->GCS",
                     };
                     info!("Applying modification from '{}' ({})", modifier, direction_label);
 
@@ -346,55 +388,59 @@ impl ProxyServer {
             );
         }
 
-        // Bind GCS listener socket
-        let gcs_socket = Arc::new(
-            UdpSocket::bind(format!(
-                "{}:{}",
-                self.config.network.gcs_listen_address, self.config.network.gcs_listen_port
-            ))
-            .await
-            .context("Failed to bind GCS listener socket")?,
-        );
+        // Bind TCP listener for GCS connections
+        let gcs_listener = TcpListener::bind(format!(
+            "{}:{}",
+            self.config.network.gcs_listen_address, self.config.network.gcs_listen_port
+        ))
+        .await
+        .context("Failed to bind GCS TCP listener")?;
 
-        // Create router socket
-        let router_socket = Arc::new(
-            UdpSocket::bind("0.0.0.0:0")
-                .await
-                .context("Failed to create router socket")?,
-        );
+        info!("TCP listener initialized");
 
+        // Accept GCS connection
+        info!("Waiting for GCS connection...");
+        let (gcs_stream, gcs_addr) = gcs_listener.accept().await.context("Failed to accept GCS connection")?;
+        info!("GCS connected from: {}", gcs_addr);
+
+        // Connect to mavlink-router
         let router_addr = format!(
             "{}:{}",
             self.config.network.router_address, self.config.network.router_port
         );
-        router_socket
-            .connect(&router_addr)
+        let router_stream = TcpStream::connect(&router_addr)
             .await
             .context("Failed to connect to mavlink-router")?;
+        info!("Connected to mavlink-router at {}", router_addr);
 
-        info!("Sockets initialized");
+        // Split streams for concurrent reading/writing
+        let (gcs_read, gcs_write) = gcs_stream.into_split();
+        let (router_read, router_write) = router_stream.into_split();
+
+        let gcs_write = Arc::new(RwLock::new(gcs_write));
+        let router_write = Arc::new(RwLock::new(router_write));
 
         // Spawn GCS -> Router forwarding task
         let gcs_to_router_task = {
-            let gcs_socket = gcs_socket.clone();
-            let router_socket = router_socket.clone();
+            let router_write = router_write.clone();
+            let gcs_write = gcs_write.clone();
             let state = self.state.clone();
             let rule_engine = self.rule_engine.clone();
 
             tokio::spawn(async move {
-                Self::forward_gcs_to_router(gcs_socket, router_socket, state, rule_engine).await
+                Self::forward_gcs_to_router(gcs_read, router_write, gcs_write, state, rule_engine).await
             })
         };
 
         // Spawn Router -> GCS forwarding task
         let router_to_gcs_task = {
-            let gcs_socket = gcs_socket.clone();
-            let router_socket = router_socket.clone();
+            let gcs_write = gcs_write.clone();
+            let router_write = router_write.clone();
             let state = self.state.clone();
             let rule_engine = self.rule_engine.clone();
 
             tokio::spawn(async move {
-                Self::forward_router_to_gcs(router_socket, gcs_socket, state, rule_engine).await
+                Self::forward_router_to_gcs(router_read, gcs_write, router_write, state, rule_engine).await
             })
         };
 
@@ -413,147 +459,136 @@ impl ProxyServer {
 
     /// Forward messages from GCS to Router with rule processing
     async fn forward_gcs_to_router(
-        gcs_socket: Arc<UdpSocket>,
-        router_socket: Arc<UdpSocket>,
+        mut gcs_read: tokio::net::tcp::OwnedReadHalf,
+        router_write: Arc<RwLock<tokio::net::tcp::OwnedWriteHalf>>,
+        gcs_write: Arc<RwLock<tokio::net::tcp::OwnedWriteHalf>>,
         state: Arc<ProxyState>,
         rule_engine: Arc<RuleEngine>,
     ) -> Result<()> {
-        let mut buf = vec![0u8; 65535];
-
         info!("GCS->Router forwarding started");
 
         loop {
-            match gcs_socket.recv_from(&mut buf).await {
-                Ok((len, addr)) => {
-                    // Update GCS address if changed
-                    {
-                        let mut gcs_addr = state.gcs_addr.write().await;
-                        if *gcs_addr != Some(addr) {
-                            info!("GCS connected from: {}", addr);
-                            *gcs_addr = Some(addr);
-                        }
-                    }
-
-                    let packet = &buf[..len];
-                    debug!("GCS->Router: {} bytes from {}", len, addr);
-
-                    // Try to parse and process the MAVLink message
-                    let result = if let Ok((header, msg)) = parse_mavlink_message(packet) {
-                        rule_engine.process_message_with_direction(&header, &msg, "gcs_to_router")
-                    } else {
-                        // If we can't parse it, forward it anyway
-                        debug!("Failed to parse message, forwarding anyway");
-                        ProcessResult {
-                            actions: vec![Action::Forward],
-                            ack_info: None,
-                        }
-                    };
-
-                    // Send ACK if auto_ack is enabled (works for ANY message type)
-                    if let Some(ref ack_info) = result.ack_info {
-                        match Self::build_ack(ack_info) {
-                            Ok(ack_packet) => {
-                                if let Err(e) = gcs_socket.send_to(&ack_packet, addr).await {
-                                    error!("Failed to send {} to GCS: {}", ack_info.message_type, e);
-                                } else {
-                                    info!(
-                                        "Sent {} to GCS (sysid={})",
-                                        ack_info.message_type, ack_info.source_system
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to build {} message: {}", ack_info.message_type, e);
-                            }
-                        }
-                    }
-
-                    // Execute action sequence
-                    execute_actions_impl(
-                        result.actions,
-                        vec![packet.to_vec()],
-                        Destination::Router(router_socket.clone()),
-                        state.clone(),
-                    )
-                    .await;
-                }
+            // Read MAVLink packet from GCS
+            let packet = match read_mavlink_packet(&mut gcs_read).await {
+                Ok(pkt) => pkt,
                 Err(e) => {
-                    error!("Error receiving from GCS: {}", e);
+                    error!("Error reading from GCS: {}", e);
+                    break;
+                }
+            };
+
+            debug!("GCS->Router: {} bytes", packet.len());
+
+            // Try to parse and process the MAVLink message
+            let result = if let Ok((header, msg)) = parse_mavlink_message(&packet) {
+                rule_engine.process_message_with_direction(&header, &msg, "gcs_to_router")
+            } else {
+                // If we can't parse it, forward it anyway
+                debug!("Failed to parse message, forwarding anyway");
+                ProcessResult {
+                    actions: vec![Action::Forward],
+                    ack_info: None,
+                }
+            };
+
+            // Send ACK if auto_ack is enabled (works for ANY message type)
+            if let Some(ref ack_info) = result.ack_info {
+                match Self::build_ack(ack_info) {
+                    Ok(ack_packet) => {
+                        let mut writer = gcs_write.write().await;
+                        if let Err(e) = writer.write_all(&ack_packet).await {
+                            error!("Failed to send {} to GCS: {}", ack_info.message_type, e);
+                        } else {
+                            info!(
+                                "Sent {} to GCS (sysid={})",
+                                ack_info.message_type, ack_info.source_system
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to build {} message: {}", ack_info.message_type, e);
+                    }
                 }
             }
+
+            // Execute action sequence
+            execute_actions_impl(
+                result.actions,
+                vec![packet],
+                Destination::Router(router_write.clone()),
+                state.clone(),
+            )
+            .await;
         }
+
+        Ok(())
     }
 
-    /// Forward messages from Router to GCS (transparent)
+    /// Forward messages from Router to GCS
     async fn forward_router_to_gcs(
-        router_socket: Arc<UdpSocket>,
-        gcs_socket: Arc<UdpSocket>,
+        mut router_read: tokio::net::tcp::OwnedReadHalf,
+        gcs_write: Arc<RwLock<tokio::net::tcp::OwnedWriteHalf>>,
+        router_write: Arc<RwLock<tokio::net::tcp::OwnedWriteHalf>>,
         state: Arc<ProxyState>,
         rule_engine: Arc<RuleEngine>,
     ) -> Result<()> {
-        let mut buf = vec![0u8; 65535];
-
         info!("Router->GCS forwarding started");
 
         loop {
-            match router_socket.recv(&mut buf).await {
-                Ok(len) => {
-                    debug!("Router->GCS: {} bytes", len);
+            // Read MAVLink packet from Router
+            let packet = match read_mavlink_packet(&mut router_read).await {
+                Ok(pkt) => pkt,
+                Err(e) => {
+                    error!("Error reading from router: {}", e);
+                    break;
+                }
+            };
 
-                    // Get current GCS address
-                    let gcs_addr = state.gcs_addr.read().await;
+            debug!("Router->GCS: {} bytes", packet.len());
 
-                    if let Some(addr) = *gcs_addr {
-                        let packet = &buf[..len];
+            // Try to parse and process the MAVLink message
+            let result = if let Ok((header, msg)) = parse_mavlink_message(&packet) {
+                rule_engine.process_message_with_direction(&header, &msg, "router_to_gcs")
+            } else {
+                // If we can't parse it, forward it anyway
+                debug!("Failed to parse Router->GCS message, forwarding anyway");
+                ProcessResult {
+                    actions: vec![Action::Forward],
+                    ack_info: None,
+                }
+            };
 
-                        // Try to parse and process the MAVLink message
-                        let result = if let Ok((header, msg)) = parse_mavlink_message(packet) {
-                            rule_engine.process_message_with_direction(&header, &msg, "router_to_gcs")
+            // Send ACK if auto_ack is enabled (works for ANY message type)
+            if let Some(ref ack_info) = result.ack_info {
+                match Self::build_ack(ack_info) {
+                    Ok(ack_packet) => {
+                        let mut writer = router_write.write().await;
+                        if let Err(e) = writer.write_all(&ack_packet).await {
+                            error!("Failed to send {} to router: {}", ack_info.message_type, e);
                         } else {
-                            // If we can't parse it, forward it anyway
-                            debug!("Failed to parse Router->GCS message, forwarding anyway");
-                            ProcessResult {
-                                actions: vec![Action::Forward],
-                                ack_info: None,
-                            }
-                        };
-
-                        // Send ACK if auto_ack is enabled (works for ANY message type)
-                        if let Some(ref ack_info) = result.ack_info {
-                            match Self::build_ack(ack_info) {
-                                Ok(ack_packet) => {
-                                    if let Err(e) = router_socket.send(&ack_packet).await {
-                                        error!("Failed to send {} to router: {}", ack_info.message_type, e);
-                                    } else {
-                                        info!(
-                                            "Sent {} to router (sysid={})",
-                                            ack_info.message_type, ack_info.source_system
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Failed to build {} message: {}", ack_info.message_type, e);
-                                }
-                            }
+                            info!(
+                                "Sent {} to router (sysid={})",
+                                ack_info.message_type, ack_info.source_system
+                            );
                         }
-
-                        // Execute action sequence (router->GCS direction)
-                        execute_actions_impl(
-                            result.actions,
-                            vec![packet.to_vec()],
-                            Destination::Gcs(gcs_socket.clone(), addr),
-                            state.clone(),
-                        )
-                        .await;
-                    } else {
-                        debug!("No GCS connected, dropping packet");
+                    }
+                    Err(e) => {
+                        error!("Failed to build {} message: {}", ack_info.message_type, e);
                     }
                 }
-                Err(e) => {
-                    error!("Error receiving from router: {}", e);
-                }
             }
+
+            // Execute action sequence (router->GCS direction)
+            execute_actions_impl(
+                result.actions,
+                vec![packet],
+                Destination::Gcs(gcs_write.clone()),
+                state.clone(),
+            )
+            .await;
         }
+
+        Ok(())
     }
 }
 

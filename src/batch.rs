@@ -1,9 +1,7 @@
 use crate::rules::Action;
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use tokio::time::{sleep, Instant};
 use tracing::{debug, info, warn};
@@ -11,10 +9,10 @@ use tracing::{debug, info, warn};
 /// Destination for forwarding packets
 #[derive(Clone)]
 pub enum Destination {
-    /// Send to Router (connected socket, no address needed)
-    Router(Arc<UdpSocket>),
-    /// Send to GCS (need socket and address)
-    Gcs(Arc<UdpSocket>, SocketAddr),
+    /// Send to Router (TCP stream write half)
+    Router(Arc<RwLock<tokio::net::tcp::OwnedWriteHalf>>),
+    /// Send to GCS (TCP stream write half)
+    Gcs(Arc<RwLock<tokio::net::tcp::OwnedWriteHalf>>),
 }
 
 /// Result of queuing a message to a batch
