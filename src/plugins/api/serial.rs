@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use mlua::Lua;
+use serialport::FlowControl;
 use std::time::Duration;
 use tracing::{debug, warn};
 
@@ -57,11 +58,20 @@ pub fn init(lua: &Lua) -> Result<()> {
 fn write_serial(port: &str, baudrate: u32, data: &[u8], timeout_ms: u64) -> Result<()> {
     let mut port = serialport::new(port, baudrate)
         .timeout(Duration::from_millis(timeout_ms))
+        .flow_control(FlowControl::None)
         .open()
         .with_context(|| format!("Failed to open serial port {}", port))?;
 
+    // Arduino resets when serial port opens (DTR signal)
+    // Wait for bootloader and sketch to finish initializing (typically 1.5-2.5 seconds)
+    std::thread::sleep(Duration::from_millis(2500));
+
     port.write_all(data)
         .context("Failed to write to serial port")?;
+
+    // Flush to ensure data is sent immediately
+    port.flush()
+        .context("Failed to flush serial port")?;
 
     Ok(())
 }

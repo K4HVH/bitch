@@ -46,7 +46,7 @@ function on_match(ctx)
     log.info(string.format("Sending to Arduino: %s", drone_msg))
 
     -- Send to Arduino via serial
-    local success = serial.write("/dev/ttyUSB0", 57600, drone_msg, 3000)
+    local success = serial.write_line("/dev/ttyUSB0", 57600, drone_msg, 3000)
 
     if success then
         log.info("Serial notification sent successfully")
