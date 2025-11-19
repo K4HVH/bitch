@@ -23,11 +23,26 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then \
     rm -rf /var/lib/apt/lists/*; \
     fi
 
-# Copy source code
+# Copy dependency manifests first for better layer caching
+COPY Cargo.toml ./
+
+# Create dummy source to cache dependencies
+RUN mkdir src && \
+    echo "fn main() {}" > src/main.rs && \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+    cargo build --release --target aarch64-unknown-linux-gnu; \
+    else \
+    cargo build --release; \
+    fi && \
+    rm -rf src
+
+# Copy actual source code
 COPY . .
 
-# Build for the target architecture
-RUN if [ "$TARGETARCH" = "arm64" ]; then \
+# Force rebuild of our code but reuse dependency cache
+RUN touch src/main.rs && \
+    if [ "$TARGETARCH" = "arm64" ]; then \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
     cargo build --release --target aarch64-unknown-linux-gnu && \
     cp target/aarch64-unknown-linux-gnu/release/bitch /app/bitch; \
