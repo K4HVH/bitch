@@ -57,7 +57,7 @@ copy_fields = { command = "command", target_system = "header.system_id", target_
 # Pass full triggering context so modifier can filter by target_system
 [rules.triggers]
 activate_rules = ["show_always_armed"]
-duration_seconds = 3
+duration_seconds = 10
 on_match = true
 context = true
 
