@@ -58,7 +58,7 @@ RUN useradd -m -u 1000 bitch && \
 USER bitch
 
 # Expose the GCS listening port
-EXPOSE 14550/udp
+EXPOSE 5760/tcp
 
 # Run the application
 CMD ["bitch"]
